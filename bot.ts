@@ -1018,6 +1018,9 @@ let botStarted = false;
 // Wait a bit before setting up signal handlers to avoid immediate shutdown
 setTimeout(() => {
   botStarted = true;
+  // Add port binding for Render
+  const PORT = process.env.PORT || 3000;
+  log.info(`Bot started on port ${PORT}`);
 }, 2000);
 
 process.once('SIGINT', async ()=>{

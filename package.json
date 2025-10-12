@@ -3,7 +3,8 @@
   "version": "3.0.0",
   "type": "module",
   "scripts": {
-    "start": "node dist/scheduler.js",
+    "start": "node dist/bot.js",
+    "scheduler": "node scheduler-worker.js",
     "bot": "node --env-file=.env dist/bot.js",
     "dev:bot": "tsx bot.ts",
     "dev:scheduler": "tsx scheduler.ts",
