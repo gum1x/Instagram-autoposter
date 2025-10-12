@@ -98,3 +98,5 @@ function getKey() {
   cachedKey = crypto.scryptSync(secret, SALT, 32);
   return cachedKey;
 }
+
+export { log };

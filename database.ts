@@ -104,7 +104,7 @@ export class SupabaseAdapter implements DatabaseAdapter {
             nickname: params[2],
             username: params[3],
             cookie_path: params[4],
-            created_at: params[5]fix
+            created_at: params[5]
           });
         if (error) {
           console.error('Supabase insert account error:', error);

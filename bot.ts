@@ -73,7 +73,7 @@ const lastScheduledForUser = db.prepare(`
 const insertPost = db.prepare(`insert into posts(id,tg_user_id,platform,ig_account,tt_account,video_path,caption,hashtags,schedule_type,schedule_at,every_hours,status,created_at)
   values(?,?,?,?,?,?,?,?,?,?,?,'queued',?)`);
 
-type AccountSetupStage = 'username'|'nickname'|'cookies';
+type AccountSetupStage = 'username'|'nickname'|'password'|'login'|'twofa';
 type Session = {
   files: string[];
   platform?: 'instagram'|'tiktok'|'both';
@@ -91,6 +91,8 @@ type Session = {
     stage: AccountSetupStage;
     username?: string;
     nickname?: string;
+    password?: string;
+    twoFactorCode?: string;
   };
 };
 const sessions = new Map<number, Session>();
@@ -217,17 +219,105 @@ BOT.on('text', async (ctx) => {
         ? s.accountSetup.username!
         : nickname;
       s.accountSetup.nickname = normalized;
-      s.accountSetup.stage = 'cookies';
+      s.accountSetup.stage = 'password';
       sessions.set(ctx.from.id, s);
-      await ctx.reply(`Paste ${s.accountSetup.platform === 'instagram' ? 'Instagram' : 'TikTok'} cookie JSON for ${normalized}.`, 
+      await ctx.reply(`Enter ${s.accountSetup.platform === 'instagram' ? 'Instagram' : 'TikTok'} password for @${s.accountSetup.username}:`, 
         Markup.inlineKeyboard([
-          [Markup.button.callback('❓ Help - How to get cookies', 'cookie_help')]
+          [Markup.button.callback('❓ Help - Login Process', 'login_help')]
         ])
       );
       return;
     }
-    if (s.accountSetup.stage === 'cookies') {
-      await saveCookies(ctx, s.accountSetup.platform, s.accountSetup.username!, s.accountSetup.nickname!, text);
+    if (s.accountSetup.stage === 'password') {
+      s.accountSetup.password = text;
+      s.accountSetup.stage = 'login';
+      sessions.set(ctx.from.id, s);
+      await ctx.reply('🔐 Logging in... This may take a moment. Please wait.');
+      
+      // Import the login function
+      const { loginToInstagram } = await import('./instagram-login.js');
+      
+      try {
+        const result = await loginToInstagram({
+          username: s.accountSetup.username!,
+          password: s.accountSetup.password!,
+          twoFactorCode: undefined
+        });
+        
+        if (result.success && result.cookies) {
+          // Save the cookies
+          const file = cookieFilePath(s.accountSetup.platform, ctx.from.id, s.accountSetup.nickname!);
+          fs.mkdirSync(path.dirname(file), { recursive: true });
+          writeEncryptedJson(file, result.cookies);
+          
+          // Save to database
+          deleteAccount.run(String(ctx.from.id), s.accountSetup.platform, s.accountSetup.nickname!);
+          addAccount.run(String(ctx.from.id), s.accountSetup.platform, s.accountSetup.nickname!, s.accountSetup.username!, file, dayjs().toISOString());
+          
+          await ctx.reply(`✅ Successfully logged in and saved ${s.accountSetup.platform} account "${s.accountSetup.nickname}".`, mainMenu());
+          log.info('Account setup completed', { platform: s.accountSetup.platform, nickname: s.accountSetup.nickname, userId: ctx.from.id });
+          
+          delete s.accountSetup;
+          sessions.set(ctx.from.id, s);
+        } else if (result.needs2FA) {
+          s.accountSetup.stage = 'twofa';
+          sessions.set(ctx.from.id, s);
+          await ctx.reply('🔐 **2FA Required**\n\nYour Instagram account has 2FA enabled. Please enter the 6-digit code from your authenticator app:');
+        } else {
+          await ctx.reply(`❌ Login failed: ${result.error || 'Unknown error'}\n\nPlease try again with /add_account.`);
+          delete s.accountSetup;
+          sessions.set(ctx.from.id, s);
+        }
+      } catch (error) {
+        await ctx.reply(`❌ Login failed: ${error instanceof Error ? error.message : String(error)}\n\nPlease try again with /add_account.`);
+        log.error('Login failed during account setup', { error: error instanceof Error ? error.message : String(error), userId: ctx.from.id });
+        delete s.accountSetup;
+        sessions.set(ctx.from.id, s);
+      }
+      return;
+    }
+    if (s.accountSetup.stage === 'twofa') {
+      const code = text.trim();
+      if (!/^\d{6}$/.test(code)) {
+        await ctx.reply('❌ Please enter a valid 6-digit 2FA code.');
+        return;
+      }
+      
+      s.accountSetup.twoFactorCode = code;
+      s.accountSetup.stage = 'login';
+      sessions.set(ctx.from.id, s);
+      await ctx.reply('🔐 Completing login with 2FA code...');
+      
+      // Import the login function
+      const { loginToInstagram } = await import('./instagram-login.js');
+      
+      try {
+        const result = await loginToInstagram({
+          username: s.accountSetup.username!,
+          password: s.accountSetup.password!,
+          twoFactorCode: s.accountSetup.twoFactorCode!
+        });
+        
+        if (result.success && result.cookies) {
+          // Save the cookies
+          const file = cookieFilePath(s.accountSetup.platform, ctx.from.id, s.accountSetup.nickname!);
+          fs.mkdirSync(path.dirname(file), { recursive: true });
+          writeEncryptedJson(file, result.cookies);
+          
+          // Save to database
+          deleteAccount.run(String(ctx.from.id), s.accountSetup.platform, s.accountSetup.nickname!);
+          addAccount.run(String(ctx.from.id), s.accountSetup.platform, s.accountSetup.nickname!, s.accountSetup.username!, file, dayjs().toISOString());
+          
+          await ctx.reply(`✅ Successfully logged in and saved ${s.accountSetup.platform} account "${s.accountSetup.nickname}".`, mainMenu());
+          log.info('Account setup completed with 2FA', { platform: s.accountSetup.platform, nickname: s.accountSetup.nickname, userId: ctx.from.id });
+        } else {
+          await ctx.reply(`❌ 2FA login failed: ${result.error || 'Unknown error'}\n\nPlease try again with /add_account.`);
+        }
+      } catch (error) {
+        await ctx.reply(`❌ 2FA login failed: ${error instanceof Error ? error.message : String(error)}\n\nPlease try again with /add_account.`);
+        log.error('2FA login failed during account setup', { error: error instanceof Error ? error.message : String(error), userId: ctx.from.id });
+      }
+      
       delete s.accountSetup;
       sessions.set(ctx.from.id, s);
       return;
@@ -729,6 +819,38 @@ BOT.action('hashtags', async (ctx)=>{
 });
 BOT.action('back', async (ctx)=>{ await ctx.answerCbQuery(); await ctx.reply('Main menu:', mainMenu()); });
 
+BOT.action('login_help', async (ctx) => {
+  await ctx.answerCbQuery();
+  const helpText = `🔐 **Instagram Login Process:**
+
+**What happens:**
+1. You provide your username and password
+2. The bot logs into Instagram on the server (headlessly)
+3. If 2FA is enabled, you'll be prompted for the code via Telegram
+4. Once logged in, cookies are saved for future use
+
+**Security:**
+- Your password is only used for initial login
+- After login, only cookies are stored (encrypted)
+- Login happens on the server, not your device
+- Your credentials are not stored permanently
+
+**2FA Support:**
+- If your account has 2FA enabled, you'll be prompted via Telegram
+- Enter the 6-digit code from your authenticator app
+- The bot will handle the rest automatically
+
+**Troubleshooting:**
+- Make sure your username/password are correct
+- Check if your account is locked or restricted
+- Ensure 2FA codes are entered quickly (they expire)
+- The login process runs on the server, so no browser window will open`;
+  
+  await ctx.reply(helpText, Markup.inlineKeyboard([
+    [Markup.button.callback('✅ Got it', 'back_to_setup')]
+  ]));
+});
+
 BOT.action('cookie_help', async (ctx) => {
   await ctx.answerCbQuery();
   const helpText = `🍪 **How to get Instagram/TikTok cookies:**
@@ -887,6 +1009,29 @@ function splitButtons(btns:any[], perRow=3){
 }
 
 
-BOT.launch().then(()=>log.info('Bot online'));
-process.once('SIGINT', ()=>BOT.stop('SIGINT'));
-process.once('SIGTERM', ()=>BOT.stop('SIGTERM'));
+BOT.launch().then(()=>log.info('Bot online')).catch(err=>log.error('Bot launch failed', err));
+
+let isShuttingDown = false;
+let botStarted = false;
+
+// Wait a bit before setting up signal handlers to avoid immediate shutdown
+setTimeout(() => {
+  botStarted = true;
+}, 2000);
+
+process.once('SIGINT', async ()=>{
+  if (!isShuttingDown && botStarted) {
+    isShuttingDown = true;
+    log.info('Received SIGINT, shutting down gracefully...');
+    await BOT.stop('SIGINT');
+    process.exit(0);
+  }
+});
+process.once('SIGTERM', async ()=>{
+  if (!isShuttingDown && botStarted) {
+    isShuttingDown = true;
+    log.info('Received SIGTERM, shutting down gracefully...');
+    await BOT.stop('SIGTERM');
+    process.exit(0);
+  }
+});

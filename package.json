@@ -7,7 +7,16 @@
     "bot": "node --env-file=.env dist/bot.js",
     "dev:bot": "tsx bot.ts",
     "dev:scheduler": "tsx scheduler.ts",
-    "build": "tsc"
+    "build": "tsc",
+    "pm2:start": "pm2 start ecosystem.config.cjs",
+    "pm2:stop": "pm2 stop all",
+    "pm2:restart": "pm2 restart all",
+    "pm2:status": "pm2 status",
+    "pm2:logs": "pm2 logs",
+    "pm2:monit": "pm2 monit",
+    "backend:start": "./start-backend.sh",
+    "backend:stop": "./stop-backend.sh",
+    "backend:restart": "./manage.sh restart"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.75.0",
@@ -16,6 +25,7 @@
     "dayjs": "^1.11.13",
     "dotenv": "^16.4.5",
     "node-cron": "^3.0.3",
+    "pm2": "^6.0.13",
     "puppeteer": "^22.13.1",
     "telegraf": "^4.16.3",
     "uuid": "^9.0.1"
