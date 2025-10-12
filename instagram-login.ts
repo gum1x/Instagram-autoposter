@@ -21,21 +21,58 @@ export async function loginToInstagram(credentials: LoginCredentials): Promise<L
     try {
       log.info('Starting Instagram login process', { username: credentials.username });
       
-      const browser = await puppeteer.launch({
-        headless: true, // Run headlessly on server
-        args: [
-          '--no-sandbox',
-          '--disable-setuid-sandbox',
-          '--disable-dev-shm-usage',
-          '--disable-accelerated-2d-canvas',
-          '--no-first-run',
-          '--no-zygote',
-          '--single-process',
-          '--disable-gpu',
-          '--disable-web-security',
-          '--disable-features=VizDisplayCompositor'
-        ]
-      });
+      let browser;
+      try {
+        // Try headless first, fallback to non-headless for local development
+        const isHeadless = process.env.HEADLESS !== 'false';
+        log.info('Launching browser', { headless: isHeadless });
+        
+        browser = await puppeteer.launch({
+          headless: isHeadless,
+          args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-accelerated-2d-canvas',
+            '--no-first-run',
+            '--no-zygote',
+            '--single-process',
+            '--disable-gpu',
+            '--disable-web-security',
+            '--disable-features=VizDisplayCompositor',
+            '--disable-background-timer-throttling',
+            '--disable-backgrounding-occluded-windows',
+            '--disable-renderer-backgrounding',
+            '--disable-field-trial-config',
+            '--disable-back-forward-cache',
+            '--disable-ipc-flooding-protection',
+            '--memory-pressure-off',
+            '--max_old_space_size=4096',
+            '--disable-extensions',
+            '--disable-plugins',
+            '--disable-default-apps',
+            '--disable-sync',
+            '--disable-translate',
+            '--hide-scrollbars',
+            '--mute-audio',
+            '--no-default-browser-check',
+            '--no-pings',
+            '--disable-logging',
+            '--disable-permissions-api',
+            '--disable-presentation-api',
+            '--disable-speech-api',
+            '--disable-file-system',
+            '--disable-notifications'
+          ],
+          timeout: 30000,
+          protocolTimeout: 30000
+        });
+        log.info('Browser launched successfully');
+      } catch (browserError) {
+        log.error('Browser launch failed:', browserError);
+        resolve({ success: false, error: `Browser launch failed: ${browserError.message}` });
+        return;
+      }
 
       const page = await browser.newPage();
       await page.setViewport({ width: 1280, height: 900 });
@@ -43,8 +80,19 @@ export async function loginToInstagram(credentials: LoginCredentials): Promise<L
 
       // Navigate to Instagram login page
       log.info('Navigating to Instagram login page');
-      await page.goto('https://www.instagram.com/accounts/login/', { waitUntil: 'networkidle2' });
-      await new Promise(resolve => setTimeout(resolve, 2000));
+      try {
+        await page.goto('https://www.instagram.com/accounts/login/', { 
+          waitUntil: 'networkidle2',
+          timeout: 30000 
+        });
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        log.info('Successfully navigated to Instagram login page');
+      } catch (navError) {
+        log.error('Navigation failed:', navError);
+        await browser.close();
+        resolve({ success: false, error: `Navigation failed: ${navError.message}` });
+        return;
+      }
 
       // Fill username
       log.info('Filling username');

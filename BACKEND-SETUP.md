@@ -113,11 +113,11 @@ npx pm2 save
 
 This will create a startup script that runs PM2 when your system boots.
 
-## 📱 Testing
+##  Testing
 
 Once running, test your bot by:
 1. Finding your bot on Telegram
 2. Sending `/start` command
 3. Uploading media and scheduling posts
 
-Your bot is now running as a local backend service! 🎉
+Your bot is now running as a local backend service! 
