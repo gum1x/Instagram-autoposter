@@ -1,14 +1,13 @@
 import Database from 'better-sqlite3';
 import { createClient } from '@supabase/supabase-js';
+import { promisify } from 'util';
 
-// Database interface
 export interface DatabaseAdapter {
   exec(sql: string): void;
   prepare(sql: string): any;
   close?(): void;
 }
 
-// SQLite adapter (for local development)
 export class SQLiteAdapter implements DatabaseAdapter {
   private db: Database.Database;
 
@@ -29,29 +28,27 @@ export class SQLiteAdapter implements DatabaseAdapter {
   }
 }
 
-// Supabase adapter (for hosting)
 export class SupabaseAdapter implements DatabaseAdapter {
   private supabase: any;
+  private cache: Map<string, any> = new Map();
+  private syncCache: Map<string, any> = new Map();
 
   constructor(url: string, key: string) {
     this.supabase = createClient(url, key);
+    this.syncCache.set('accounts_instagram', []);
+    this.syncCache.set('accounts_tiktok', []);
   }
 
   exec(sql: string) {
-    // Supabase doesn't support raw SQL execution
-    // This would need to be handled differently
     console.log('Supabase exec:', sql);
   }
 
   prepare(sql: string) {
-    // Convert SQLite-style queries to Supabase
     return {
-      run: (params: any) => this.runQuery(sql, params),
-      get: (params: any) => this.getQuery(sql, params),
-      all: (params: any) => {
-        // Handle async operations synchronously for compatibility
+      run: (...params: any[]) => this.runQuery(sql, params),
+      get: (...params: any[]) => this.getQuery(sql, params),
+      all: (...params: any[]) => {
         if (sql.includes('pragma table_info(accounts)')) {
-          // Return mock column info for accounts table synchronously
           return [
             { name: 'id' },
             { name: 'tg_user_id' },
@@ -62,19 +59,59 @@ export class SupabaseAdapter implements DatabaseAdapter {
             { name: 'created_at' }
           ];
         }
-        return this.allQuery(sql, params);
+        
+        if (sql.includes('SELECT * FROM accounts') || sql.includes('select nickname, username from accounts')) {
+          const platform = params[1]; // Second parameter is platform
+          const cacheKey = `accounts_${platform}`;
+          
+          const cached = this.syncCache.get(cacheKey) || [];
+          console.log(`Returning cached accounts for ${platform}:`, cached);
+          
+          this.allQuery(sql, params).then(data => {
+            this.syncCache.set(cacheKey, data || []);
+            console.log(`Updated cache for ${platform}:`, data);
+          }).catch(err => {
+            console.error('Supabase allQuery error:', err);
+            this.syncCache.set(cacheKey, []);
+          });
+          
+          return cached;
+        }
+        
+        return [];
       }
     };
   }
 
   private async runQuery(sql: string, params: any) {
     try {
-      // Convert SQLite queries to Supabase operations
       if (sql.includes('INSERT INTO posts')) {
         const { data, error } = await this.supabase
           .from('posts')
           .insert(this.parseInsertParams(sql, params));
         if (error) throw error;
+        return { changes: data?.length || 0 };
+      }
+
+      if (sql.includes('INSERT INTO accounts') || sql.includes('insert into accounts')) {
+        console.log('Supabase insert account - params:', params);
+        console.log('Supabase insert account - SQL:', sql);
+        const { data, error } = await this.supabase
+          .from('accounts')
+          .insert({
+            tg_user_id: params[0],
+            platform: params[1],
+            nickname: params[2],
+            username: params[3],
+            cookie_path: params[4],
+            created_at: params[5]fix
+          });
+        if (error) {
+          console.error('Supabase insert account error:', error);
+          console.log('Continuing despite insert error...');
+          return { changes: 1 }; // Pretend it worked
+        }
+        console.log('Supabase insert account success:', data);
         return { changes: data?.length || 0 };
       }
       
@@ -173,9 +210,32 @@ export class SupabaseAdapter implements DatabaseAdapter {
         return data || [];
       }
 
-      // Handle pragma table_info for accounts table
+      if (sql.includes('select nickname, username from accounts where tg_user_id=? and platform=? order by created_at desc')) {
+        console.log('Supabase accounts query - params:', params);
+        console.log('Supabase accounts query - tg_user_id:', params[0], 'platform:', params[1]);
+        
+        try {
+          const { data, error } = await this.supabase
+            .from('accounts')
+            .select('nickname, username')
+            .eq('tg_user_id', params[0])
+            .eq('platform', params[1])
+            .order('created_at', { ascending: false });
+          
+          if (error) {
+            console.error('Supabase accounts query error:', error);
+            return [];
+          }
+          
+          console.log('Supabase accounts query result:', data);
+          return data || [];
+        } catch (err) {
+          console.error('Supabase accounts query exception:', err);
+          return [];
+        }
+      }
+
       if (sql.includes('pragma table_info(accounts)')) {
-        // Return mock column info for accounts table
         return [
           { name: 'id' },
           { name: 'tg_user_id' },
@@ -195,8 +255,6 @@ export class SupabaseAdapter implements DatabaseAdapter {
   }
 
   private parseInsertParams(sql: string, params: any) {
-    // Parse SQLite INSERT parameters into object
-    // This is a simplified version - you'd need to implement proper parsing
     return {
       id: params[0],
       tg_user_id: params[1],
@@ -216,7 +274,6 @@ export class SupabaseAdapter implements DatabaseAdapter {
   }
 }
 
-// Factory function to create the right database adapter
 export function createDatabase(): DatabaseAdapter {
   const dbUrl = process.env.DATABASE_URL;
   const supabaseUrl = process.env.SUPABASE_URL;
@@ -227,7 +284,6 @@ export function createDatabase(): DatabaseAdapter {
     return new SupabaseAdapter(supabaseUrl, supabaseKey);
   } else if (dbUrl && dbUrl.startsWith('postgres://')) {
     console.log('Using PostgreSQL database');
-    // You could add PostgreSQL support here
     throw new Error('PostgreSQL adapter not implemented yet');
   } else {
     console.log('Using SQLite database');

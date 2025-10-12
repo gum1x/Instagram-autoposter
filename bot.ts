@@ -36,7 +36,7 @@ create table if not exists settings(
   platform_pref text
 );
 create table if not exists accounts(
-  id integer primary key autoincrement,
+  id serial primary key,
   tg_user_id text,
   platform text,
   nickname text,
@@ -137,7 +137,6 @@ BOT.on('video', async (ctx) => {
 BOT.on('photo', async (ctx) => {
   try {
     const s = sessions.get(ctx.from.id) || { files: [] };
-    // Get the largest photo size
     const photo = ctx.message.photo[ctx.message.photo.length - 1];
     const file = await ctx.telegram.getFile(photo.file_id);
     const url = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
@@ -155,19 +154,50 @@ BOT.on('photo', async (ctx) => {
   }
 });
 
+BOT.on('document', async (ctx) => {
+  try {
+    const document = ctx.message.document;
+    
+    const imageMimeTypes = ['image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp'];
+    if (!imageMimeTypes.includes(document.mime_type)) {
+      await ctx.reply('❌ Please send an image file (JPEG, PNG, GIF, or WebP).');
+      return;
+    }
+    
+    const s = sessions.get(ctx.from.id) || { files: [] };
+    const file = await ctx.telegram.getFile(document.file_id);
+    const url = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
+    
+    let ext = '.jpg';
+    if (document.mime_type === 'image/png') ext = '.png';
+    else if (document.mime_type === 'image/gif') ext = '.gif';
+    else if (document.mime_type === 'image/webp') ext = '.webp';
+    
+    const dest = path.join('uploads', `${document.file_id}${ext}`);
+    fs.mkdirSync('uploads', { recursive: true });
+    const res = await fetch(url);
+    const buf = Buffer.from(await res.arrayBuffer());
+    fs.writeFileSync(dest, buf);
+    s.files.push(dest);
+    sessions.set(ctx.from.id, s);
+    await ctx.reply(`✅ Success saved image file (${s.files.length}). Send more or type "done".`);
+  } catch (error) {
+    await ctx.reply('❌ Failed to save image file. Please try again.');
+    log.warn('Failed to save document', { error: error instanceof Error ? error.message : String(error), userId: ctx.from.id });
+  }
+});
+
 BOT.on('text', async (ctx) => {
   const text = ctx.message.text.trim();
   const lower = text.toLowerCase();
   const existing = sessions.get(ctx.from.id);
 
   if (!existing) {
-    // Nothing active for this user; ignore free-form text.
     return;
   }
 
   const s = existing;
 
-  // Account setup flow
   if (s.accountSetup) {
     if (s.accountSetup.stage === 'username') {
       const username = text.replace(/^@/, '').trim();
@@ -204,7 +234,6 @@ BOT.on('text', async (ctx) => {
     }
   }
 
-  // Upload -> done flow
   if (lower === 'done' && s.files?.length && !s.expecting) {
     await ctx.reply('Choose platforms:', Markup.inlineKeyboard([
       [Markup.button.callback('Instagram', 'pf_ig'), Markup.button.callback('TikTok', 'pf_tt'), Markup.button.callback('Both', 'pf_both')]
@@ -212,12 +241,10 @@ BOT.on('text', async (ctx) => {
     return;
   }
 
-  // Handle expected inputs
   if (s.expecting === 'datetime') {
     let d;
     const textLower = text.toLowerCase();
     
-    // Handle natural language
     if (textLower.includes('tomorrow')) {
       d = dayjs().add(1, 'day');
       if (textLower.includes('9am') || textLower.includes('9 am')) d = d.hour(9).minute(0);
@@ -231,7 +258,6 @@ BOT.on('text', async (ctx) => {
       else if (textLower.includes('6pm') || textLower.includes('6 pm')) d = d.hour(18).minute(0);
       else if (textLower.includes('9pm') || textLower.includes('9 pm')) d = d.hour(21).minute(0);
     } else {
-      // Try parsing as ISO or standard format
       d = dayjs(text.replace(' ', 'T'));
     }
     
@@ -240,7 +266,6 @@ BOT.on('text', async (ctx) => {
       return;
     }
     
-    // Ensure it's in the future
     if (d.isBefore(dayjs())) {
       await ctx.reply('⚠️ That time is in the past. Please choose a future time.');
       return;
@@ -321,7 +346,8 @@ async function selectPlatform(ctx:any, p:'instagram'|'tiktok'|'both'){
 
   if (p === 'instagram' || p === 'both') {
     const igs = listAccounts.all(String(ctx.from.id), 'instagram') as any[];
-    if (igs.length === 0) {
+    console.log('Instagram accounts query result:', igs);
+    if (!Array.isArray(igs) || igs.length === 0) {
       await ctx.reply('No Instagram accounts saved. Add one in Accounts → Add IG.');
     } else {
       await ctx.reply('Pick Instagram account:', Markup.inlineKeyboard(splitButtons(igs.map(r=>Markup.button.callback(r.nickname, 'igacc_'+r.nickname)))));
@@ -329,7 +355,8 @@ async function selectPlatform(ctx:any, p:'instagram'|'tiktok'|'both'){
   }
   if (p === 'tiktok' || p === 'both') {
     const tts = listAccounts.all(String(ctx.from.id), 'tiktok') as any[];
-    if (tts.length === 0) {
+    console.log('TikTok accounts query result:', tts);
+    if (!Array.isArray(tts) || tts.length === 0) {
       await ctx.reply('No TikTok accounts saved. Add one in Accounts → Add TT.');
     } else {
       await ctx.reply('Pick TikTok account:', Markup.inlineKeyboard(splitButtons(tts.map(r=>Markup.button.callback(r.nickname, 'ttacc_'+r.nickname)))));
@@ -394,13 +421,11 @@ async function chooseWhen(ctx:any, w:'now'|'after2h'|'tomorrow'|'at'|'everyXh'|'
     sessions.set(ctx.from.id, s);
     await ctx.reply('⏰ How many hours between posts? (e.g., 3)');
   } else if (w === 'tomorrow') {
-    // Set to tomorrow 9AM
     s.atISO = dayjs().add(1, 'day').hour(9).minute(0).toISOString();
     s.expecting = 'caption';
     sessions.set(ctx.from.id, s);
     await ctx.reply('✅ Scheduled for tomorrow 9AM\n✍️ Send a caption (or type "skip").');
   } else if (w === 'smart') {
-    // Smart scheduling: spread posts throughout optimal times
     s.when = 'smart';
     s.expecting = 'caption';
     sessions.set(ctx.from.id, s);
@@ -447,7 +472,6 @@ async function persistScheduledPosts(userId:number, s:Session){
   const scheduledTimes: dayjs.Dayjs[] = [];
   
   if (when === 'smart') {
-    // Smart scheduling: spread across optimal times (9AM, 1PM, 5PM, 9PM)
     const optimalTimes = [9, 13, 17, 21]; // 9AM, 1PM, 5PM, 9PM
     for (let i = 0; i < files.length; i++) {
       const dayOffset = Math.floor(i / optimalTimes.length);
@@ -527,18 +551,19 @@ async function saveCookies(ctx:any, platform:'instagram'|'tiktok', username:stri
   try{
     let cookies;
     
-    // Try to parse as JSON first
     try {
       cookies = JSON.parse(rawInput);
+      console.log('Parsed as JSON:', cookies.length, 'cookies');
     } catch {
-      // If JSON fails, try parsing as tab-separated cookie format
+      console.log('JSON parsing failed, trying tab-separated format');
+      console.log('Raw input length:', rawInput.length);
+      console.log('Raw input preview:', rawInput.substring(0, 200));
       cookies = parseTabSeparatedCookies(rawInput);
+      console.log('Parsed as tab-separated:', cookies.length, 'cookies');
     }
     
-    // Validate cookies
     const validation = validateCookies(cookies, platform);
     if (!validation.valid) {
-      // Store cookies temporarily in session for the "save anyway" option
       const s = sessions.get(ctx.from.id) || { files: [] };
       s.tempCookies = cookies;
       sessions.set(ctx.from.id, s);
@@ -573,7 +598,6 @@ function validateCookies(cookies: any[], platform: 'instagram'|'tiktok'): {valid
   const cookieNames = cookies.map(c => c.name?.toLowerCase() || '');
   
   if (platform === 'instagram') {
-    // Check for essential Instagram cookies
     const essentialCookies = ['sessionid', 'csrftoken', 'ds_user_id'];
     const missingEssential = essentialCookies.filter(name => !cookieNames.includes(name));
     
@@ -581,27 +605,23 @@ function validateCookies(cookies: any[], platform: 'instagram'|'tiktok'): {valid
       warnings.push(`Missing essential Instagram cookies: ${missingEssential.join(', ')}`);
     }
     
-    // Check for suspicious domains
     const wrongDomains = cookies.filter(c => c.domain && !c.domain.includes('instagram.com'));
     if (wrongDomains.length > 0) {
       warnings.push(`Found cookies for non-Instagram domains: ${wrongDomains.map(c => c.domain).join(', ')}`);
     }
     
-    // Check for expired cookies
     const now = Date.now() / 1000;
     const expiredCookies = cookies.filter(c => c.expires && c.expires < now);
     if (expiredCookies.length > 0) {
       warnings.push(`${expiredCookies.length} cookies appear to be expired`);
     }
     
-    // Check for very old cookies (might be stale)
     const oldCookies = cookies.filter(c => c.expires && c.expires < now + (30 * 24 * 60 * 60)); // 30 days
     if (oldCookies.length > cookies.length * 0.5) {
       warnings.push('Many cookies expire soon - you may need fresh ones');
     }
     
   } else if (platform === 'tiktok') {
-    // Check for essential TikTok cookies
     const essentialCookies = ['sessionid', 'ttwid'];
     const missingEssential = essentialCookies.filter(name => !cookieNames.includes(name));
     
@@ -609,7 +629,6 @@ function validateCookies(cookies: any[], platform: 'instagram'|'tiktok'): {valid
       warnings.push(`Missing essential TikTok cookies: ${missingEssential.join(', ')}`);
     }
     
-    // Check for suspicious domains
     const wrongDomains = cookies.filter(c => c.domain && !c.domain.includes('tiktok.com'));
     if (wrongDomains.length > 0) {
       warnings.push(`Found cookies for non-TikTok domains: ${wrongDomains.map(c => c.domain).join(', ')}`);
@@ -626,8 +645,11 @@ function parseTabSeparatedCookies(input: string): any[] {
   for (const line of lines) {
     if (!line.trim()) continue;
     
-    // Split by tab and extract cookie data
-    const parts = line.split('\t');
+    let parts = line.split('\t');
+    if (parts.length < 2) {
+      parts = line.split(/\s{2,}/); // Split by 2 or more consecutive spaces
+    }
+    
     if (parts.length < 2) continue;
     
     const name = parts[0].trim();
@@ -658,7 +680,6 @@ BOT.action('schedule', async (ctx)=>{
   await ctx.answerCbQuery();
   const uid = String(ctx.from!.id);
   
-  // Get upcoming posts
   const upcomingPosts = db.prepare(`
     SELECT id, platform, ig_account, tt_account, caption, schedule_at, status, schedule_type, every_hours
     FROM posts 
@@ -793,7 +814,6 @@ BOT.action('clear_schedule', async (ctx) => {
   await ctx.answerCbQuery();
   const uid = String(ctx.from!.id);
   
-  // Count queued posts
   const count = db.prepare(`SELECT COUNT(*) as count FROM posts WHERE tg_user_id = ? AND status = 'queued'`).get(uid) as {count: number};
   
   if (count.count === 0) {

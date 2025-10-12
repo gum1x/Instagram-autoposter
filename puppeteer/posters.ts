@@ -19,7 +19,6 @@ const BROWSER_ARGS = [
   '--memory-pressure-off'
 ];
 
-// Cache successful selectors to speed up future attempts
 const selectorCache = new Map<string, string[]>();
 
 type Cookies = any[];
@@ -53,11 +52,9 @@ export async function postInstagram(userId: string, nickname: string, videoPath:
       await page.setViewport({ width: 1280, height: 900 });
       await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
       
-      // Block only Facebook redirects, allow necessary Facebook API calls
       await page.setRequestInterception(true);
       page.on('request', (request) => {
         const url = request.url();
-        // Only block Facebook pages/redirects, not API calls
         if (url.includes('facebook.com/') && !url.includes('/api/') && !url.includes('/ig_xsite_')) {
           log.info('Blocked Facebook page request', { url });
           request.abort();
@@ -68,7 +65,6 @@ export async function postInstagram(userId: string, nickname: string, videoPath:
       
       await page.setCookie(...(cookies as any));
       
-      // Monitor navigation to ensure we stay on Instagram
       page.on('framenavigated', (frame) => {
         const url = frame.url();
         if (url.includes('facebook.com') || url.includes('fb.com')) {
@@ -87,7 +83,6 @@ export async function postInstagram(userId: string, nickname: string, videoPath:
       await page.goto('https://www.instagram.com/create/select/', { waitUntil: 'networkidle2' });
       log.info('Step 2: ✅ Create page loaded');
       
-      // Verify we're still on Instagram
       const currentUrl = page.url();
       if (!currentUrl.includes('instagram.com')) {
         throw new Error(`Redirected away from Instagram to: ${currentUrl}`);
@@ -107,7 +102,6 @@ export async function postInstagram(userId: string, nickname: string, videoPath:
       await sleep(3000); // Faster upload wait
       log.info('Step 4: ✅ File uploaded');
 
-      // Try multiple approaches to find and click Next/Continue buttons
       log.info('Step 5: Looking for Next/Continue button');
       const nextSelectors = [
         'button:has-text("Next")',
@@ -137,7 +131,6 @@ export async function postInstagram(userId: string, nickname: string, videoPath:
       
       await sleep(1500); // Faster
       
-      // Try to click Next/Share again
       log.info('Step 6: Looking for Share/Next button');
       const shareSelectors = [
         'button:has-text("Share")',
@@ -167,7 +160,6 @@ export async function postInstagram(userId: string, nickname: string, videoPath:
       
       await sleep(1000); // Faster
 
-      // Add caption
       log.info('Step 7: Adding caption', { caption });
       try {
         await typeIn(page, [
@@ -183,12 +175,10 @@ export async function postInstagram(userId: string, nickname: string, videoPath:
         log.error('Step 7: ❌ Could not add caption', { error: e instanceof Error ? e.message : String(e) });
         await page.screenshot({ path: 'debug-step7.png' });
         log.info('Screenshot saved as debug-step7.png');
-        // Don't throw - caption is optional
       }
 
       await sleep(1000); // Faster
 
-      // Final share
       log.info('Step 8: Final share');
       try {
         await clickAny(page, [
@@ -255,7 +245,6 @@ export async function postTikTok(userId: string, nickname: string, videoPath: st
 }
 
 async function clickAny(page: Page, selectors: string[], cacheKey?: string) {
-  // Use cached successful selectors first
   let orderedSelectors = selectors;
   if (cacheKey && selectorCache.has(cacheKey)) {
     const cached = selectorCache.get(cacheKey)!;
@@ -280,7 +269,6 @@ async function clickAny(page: Page, selectors: string[], cacheKey?: string) {
           return false;
         }, term);
         if (clicked) {
-          // Cache successful selector
           if (cacheKey) {
             const current = selectorCache.get(cacheKey) || [];
             if (!current.includes(raw)) {
@@ -327,7 +315,6 @@ async function clickAny(page: Page, selectors: string[], cacheKey?: string) {
         }
       }
     } catch {
-      // Try next selector
     }
   }
   throw new Error('Clickable element not found for selectors: ' + selectors.join(', '));
@@ -359,7 +346,6 @@ async function typeIn(page: Page, selectorCandidates: string[], value: string) {
         return;
       }
     } catch {
-      // Try next selector
     }
   }
   throw new Error('Unable to fill input for selectors: ' + selectorCandidates.join(', '));

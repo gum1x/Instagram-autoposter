@@ -89,14 +89,12 @@ async function tick(){
       log.error('Post failed', { postId: r.id, retryCount, error: e instanceof Error ? e.message : String(e) });
       
       if (retryCount < maxRetries) {
-        // Increment retry count and reschedule for later
         incrementRetries.run(r.id);
         const retryDelay = Math.min(30 * (retryCount + 1), 120); // 30min, 60min, 90min, max 120min
         const retryAt = dayjs().add(retryDelay, 'minute').toISOString();
         db.prepare('update posts set schedule_at=? where id=?').run(retryAt, r.id);
         log.info('Post retry scheduled', { postId: r.id, retryCount: retryCount + 1, retryAt });
       } else {
-        // Max retries reached, mark as permanently failed
         mark.run({status:'failed', id:r.id});
         log.error('Post permanently failed after max retries', { postId: r.id, retryCount });
       }
