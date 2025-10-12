@@ -5,7 +5,19 @@ import { cookieFilePath, readEncryptedJson, retry, createLogger, writeEncryptedJ
 
 const log = createLogger('posters');
 const HEADLESS = process.env.HEADLESS === 'false' ? false : true;
-const BROWSER_ARGS = ['--no-sandbox', '--disable-setuid-sandbox'];
+const BROWSER_ARGS = [
+  '--no-sandbox', 
+  '--disable-setuid-sandbox',
+  '--disable-dev-shm-usage',
+  '--disable-gpu',
+  '--no-first-run',
+  '--no-zygote',
+  '--single-process',
+  '--disable-background-timer-throttling',
+  '--disable-backgrounding-occluded-windows',
+  '--disable-renderer-backgrounding',
+  '--memory-pressure-off'
+];
 
 // Cache successful selectors to speed up future attempts
 const selectorCache = new Map<string, string[]>();
@@ -98,15 +110,19 @@ export async function postInstagram(userId: string, nickname: string, videoPath:
       // Try multiple approaches to find and click Next/Continue buttons
       log.info('Step 5: Looking for Next/Continue button');
       const nextSelectors = [
+        'button:has-text("Next")',
+        'div[role="button"]:has-text("Next")',
+        'button:has-text("Continue")',
+        'div[role="button"]:has-text("Continue")',
+        '[data-testid="next-button"]',
+        'button[type="button"]',
+        'div[role="button"]',
         'text=Next',
         'text=Continue',
         'xpath=//div[@role="button" and normalize-space()="Next"]',
         'xpath=//div[@role="button" and normalize-space()="Continue"]',
         'xpath=//button[normalize-space()="Next"]',
-        'xpath=//button[normalize-space()="Continue"]',
-        '[data-testid="next-button"]',
-        'button[type="button"]',
-        'div[role="button"]'
+        'xpath=//button[normalize-space()="Continue"]'
       ];
       
       try {
@@ -124,15 +140,19 @@ export async function postInstagram(userId: string, nickname: string, videoPath:
       // Try to click Next/Share again
       log.info('Step 6: Looking for Share/Next button');
       const shareSelectors = [
+        'button:has-text("Share")',
+        'div[role="button"]:has-text("Share")',
+        'button:has-text("Next")',
+        'div[role="button"]:has-text("Next")',
+        '[data-testid="share-button"]',
+        'button[type="button"]',
+        'div[role="button"]',
         'text=Share',
         'text=Next',
         'xpath=//div[@role="button" and normalize-space()="Share"]',
         'xpath=//div[@role="button" and normalize-space()="Next"]',
         'xpath=//button[normalize-space()="Share"]',
-        'xpath=//button[normalize-space()="Next"]',
-        '[data-testid="share-button"]',
-        'button[type="button"]',
-        'div[role="button"]'
+        'xpath=//button[normalize-space()="Next"]'
       ];
       
       try {
@@ -154,7 +174,9 @@ export async function postInstagram(userId: string, nickname: string, videoPath:
           'textarea[aria-label="Write a caption…"]',
           'textarea[aria-label="Write a caption..."]',
           'textarea[placeholder="Write a caption..."]',
-          'textarea'
+          'textarea[data-testid="post-caption"]',
+          'textarea',
+          'div[contenteditable="true"]'
         ], caption || '');
         log.info('Step 7: ✅ Caption added');
       } catch (e) {
@@ -170,10 +192,14 @@ export async function postInstagram(userId: string, nickname: string, videoPath:
       log.info('Step 8: Final share');
       try {
         await clickAny(page, [
+          'button:has-text("Share")',
+          'div[role="button"]:has-text("Share")',
+          '[data-testid="share-button"]',
+          'button[type="button"]',
+          'div[role="button"]',
           'text=Share',
           'xpath=//div[@role="button" and normalize-space()="Share"]',
-          'xpath=//button[normalize-space()="Share"]',
-          '[data-testid="share-button"]'
+          'xpath=//button[normalize-space()="Share"]'
         ], 'instagram-final-share');
         log.info('Step 8: ✅ Final share clicked');
       } catch (e) {

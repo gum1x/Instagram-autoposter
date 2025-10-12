@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import Database from 'better-sqlite3';
+import { createDatabase } from './database.js';
 import axios from 'axios';
 import cron from 'node-cron';
 import dayjs from 'dayjs';
@@ -7,7 +7,7 @@ import { postInstagram, postTikTok } from './puppeteer/posters.js';
 import { fetchInstagramStats, fetchTikTokStats, formatStats, StatsSnapshot } from './stats.js';
 import { createLogger, ensureEnv, retry } from './utils.js';
 
-const db = new Database(process.env.DATABASE_URL || 'sqlite.db');
+const db = createDatabase();
 ensureEnv(['TELEGRAM_BOT_TOKEN', 'ENCRYPTION_KEY']);
 const log = createLogger('scheduler');
 
@@ -54,6 +54,7 @@ select * from posts
  where status='queued' and datetime(schedule_at) <= datetime('now')
  order by datetime(schedule_at) asc`);
 const mark = db.prepare(`update posts set status=@status where id=@id`);
+const incrementRetries = db.prepare(`update posts set retry_count = COALESCE(retry_count, 0) + 1 where id = ?`);
 const accountsForUser = db.prepare(`select platform, nickname, username from accounts where tg_user_id=? order by platform, created_at desc`);
 const usersWithAccounts = db.prepare(`select distinct tg_user_id from accounts`);
 const STATS_DIGEST_CRON = process.env.STATS_DIGEST_CRON || '0 9 * * *';
@@ -66,6 +67,9 @@ function buildCaption(caption:string, hashtags:string){
 async function tick(){
   const rows = dueStmt.all() as any[];
   for (const r of rows){
+    const retryCount = r.retry_count || 0;
+    const maxRetries = 3;
+    
     try{
       if ((r.platform==='instagram' || r.platform==='both') && r.ig_account){
         await postInstagram(r.tg_user_id, r.ig_account, r.video_path, buildCaption(r.caption, r.hashtags));
@@ -82,8 +86,20 @@ async function tick(){
         log.info('Post completed', { postId: r.id, platform: r.platform });
       }
     }catch(e){
-      log.error('Post failed', { postId: r.id, error: e instanceof Error ? e.message : String(e) });
-      mark.run({status:'failed', id:r.id});
+      log.error('Post failed', { postId: r.id, retryCount, error: e instanceof Error ? e.message : String(e) });
+      
+      if (retryCount < maxRetries) {
+        // Increment retry count and reschedule for later
+        incrementRetries.run(r.id);
+        const retryDelay = Math.min(30 * (retryCount + 1), 120); // 30min, 60min, 90min, max 120min
+        const retryAt = dayjs().add(retryDelay, 'minute').toISOString();
+        db.prepare('update posts set schedule_at=? where id=?').run(retryAt, r.id);
+        log.info('Post retry scheduled', { postId: r.id, retryCount: retryCount + 1, retryAt });
+      } else {
+        // Max retries reached, mark as permanently failed
+        mark.run({status:'failed', id:r.id});
+        log.error('Post permanently failed after max retries', { postId: r.id, retryCount });
+      }
     }
   }
 }

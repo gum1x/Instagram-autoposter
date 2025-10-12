@@ -2,7 +2,7 @@ import 'dotenv/config';
 import { Telegraf, Markup } from 'telegraf';
 import * as fs from 'fs';
 import * as path from 'path';
-import Database from 'better-sqlite3';
+import { createDatabase, DatabaseAdapter } from './database.js';
 import { v4 as uuid } from 'uuid';
 import dayjs from 'dayjs';
 import { fetchInstagramStats, fetchTikTokStats, StatsSnapshot, formatStats } from './stats.js';
@@ -10,7 +10,7 @@ import { cookieFilePath, createLogger, ensureEnv, writeEncryptedJson } from './u
 
 ensureEnv(['TELEGRAM_BOT_TOKEN', 'ENCRYPTION_KEY']);
 const BOT = new Telegraf(process.env.TELEGRAM_BOT_TOKEN!);
-const db = new Database(process.env.DATABASE_URL || 'sqlite.db');
+const db = createDatabase();
 const log = createLogger('bot');
 
 db.exec(`
