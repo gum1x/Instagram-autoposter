@@ -1,0 +1,13 @@
+{
+  "defaultIntervalHours": 3,
+  "defaultHashtags": [
+    "#fyp",
+    "#viral",
+    "#trending"
+  ],
+  "captionTemplate": "{baseCaption}\n{hashtags}",
+  "postWindow": {
+    "startHour": 8,
+    "endHour": 23
+  }
+}
