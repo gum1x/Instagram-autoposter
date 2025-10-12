@@ -7,6 +7,9 @@ const log = createLogger('posters');
 const HEADLESS = process.env.HEADLESS === 'false' ? false : true;
 const BROWSER_ARGS = ['--no-sandbox', '--disable-setuid-sandbox'];
 
+// Cache successful selectors to speed up future attempts
+const selectorCache = new Map<string, string[]>();
+
 type Cookies = any[];
 
 export function cookieFile(platform: string, userId: string | number, nickname: string) {
@@ -37,44 +40,150 @@ export async function postInstagram(userId: string, nickname: string, videoPath:
       const page = await browser.newPage();
       await page.setViewport({ width: 1280, height: 900 });
       await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
+      
+      // Block only Facebook redirects, allow necessary Facebook API calls
+      await page.setRequestInterception(true);
+      page.on('request', (request) => {
+        const url = request.url();
+        // Only block Facebook pages/redirects, not API calls
+        if (url.includes('facebook.com/') && !url.includes('/api/') && !url.includes('/ig_xsite_')) {
+          log.info('Blocked Facebook page request', { url });
+          request.abort();
+        } else {
+          request.continue();
+        }
+      });
+      
       await page.setCookie(...(cookies as any));
+      
+      // Monitor navigation to ensure we stay on Instagram
+      page.on('framenavigated', (frame) => {
+        const url = frame.url();
+        if (url.includes('facebook.com') || url.includes('fb.com')) {
+          log.warn('Detected Facebook redirect, staying on Instagram', { url });
+          frame.goto('https://www.instagram.com/');
+        }
+      });
+      
+      log.info('Step 1: Navigating to Instagram homepage');
       await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2' });
+      log.info('Step 1: ✅ Instagram homepage loaded');
 
-      await sleep(1200 + Math.random() * 800);
+      await sleep(1000); // Faster
+      
+      log.info('Step 2: Navigating to create page');
       await page.goto('https://www.instagram.com/create/select/', { waitUntil: 'networkidle2' });
-      await page.waitForSelector('input[type="file"]', { timeout: 20000 });
-
+      log.info('Step 2: ✅ Create page loaded');
+      
+      // Verify we're still on Instagram
+      const currentUrl = page.url();
+      if (!currentUrl.includes('instagram.com')) {
+        throw new Error(`Redirected away from Instagram to: ${currentUrl}`);
+      }
+      log.info('Step 2: ✅ Confirmed still on Instagram', { url: currentUrl });
+      
+      await sleep(1000); // Faster
+      
+      log.info('Step 3: Waiting for file input');
+      await page.waitForSelector('input[type="file"]', { timeout: 30000 });
       const fileInput = await page.$('input[type="file"]');
       if (!fileInput) throw new Error('Instagram file input not found');
+      log.info('Step 3: ✅ File input found');
+      
+      log.info('Step 4: Uploading file', { filePath: resolvePath(videoPath) });
       await fileInput.uploadFile(resolvePath(videoPath));
-      await sleep(3000);
+      await sleep(3000); // Faster upload wait
+      log.info('Step 4: ✅ File uploaded');
 
-      await clickAny(page, [
+      // Try multiple approaches to find and click Next/Continue buttons
+      log.info('Step 5: Looking for Next/Continue button');
+      const nextSelectors = [
         'text=Next',
+        'text=Continue',
         'xpath=//div[@role="button" and normalize-space()="Next"]',
-        'xpath=//button[normalize-space()="Next"]'
-      ]);
-      await sleep(1200);
-      await clickAny(page, [
-        'text=Next',
-        'xpath=//div[@role="button" and normalize-space()="Next"]',
-        'xpath=//button[normalize-space()="Next"]'
-      ]);
-      await sleep(1200);
-
-      await typeIn(page, [
-        'textarea[aria-label="Write a caption…"]',
-        'textarea[aria-label="Write a caption..."]',
-        'textarea[placeholder="Write a caption..."]',
-        'textarea'
-      ], caption || '');
-
-      await clickAny(page, [
+        'xpath=//div[@role="button" and normalize-space()="Continue"]',
+        'xpath=//button[normalize-space()="Next"]',
+        'xpath=//button[normalize-space()="Continue"]',
+        '[data-testid="next-button"]',
+        'button[type="button"]',
+        'div[role="button"]'
+      ];
+      
+      try {
+        await clickAny(page, nextSelectors, 'instagram-next');
+        log.info('Step 5: ✅ Clicked Next button');
+      } catch (e) {
+        log.error('Step 5: ❌ Could not find Next button', { error: e instanceof Error ? e.message : String(e) });
+        await page.screenshot({ path: 'debug-step5.png' });
+        log.info('Screenshot saved as debug-step5.png');
+        throw e;
+      }
+      
+      await sleep(1500); // Faster
+      
+      // Try to click Next/Share again
+      log.info('Step 6: Looking for Share/Next button');
+      const shareSelectors = [
         'text=Share',
+        'text=Next',
         'xpath=//div[@role="button" and normalize-space()="Share"]',
-        'xpath=//button[normalize-space()="Share"]'
-      ]);
-      await sleep(6000);
+        'xpath=//div[@role="button" and normalize-space()="Next"]',
+        'xpath=//button[normalize-space()="Share"]',
+        'xpath=//button[normalize-space()="Next"]',
+        '[data-testid="share-button"]',
+        'button[type="button"]',
+        'div[role="button"]'
+      ];
+      
+      try {
+        await clickAny(page, shareSelectors, 'instagram-share');
+        log.info('Step 6: ✅ Clicked Share button');
+      } catch (e) {
+        log.error('Step 6: ❌ Could not find Share button', { error: e instanceof Error ? e.message : String(e) });
+        await page.screenshot({ path: 'debug-step6.png' });
+        log.info('Screenshot saved as debug-step6.png');
+        throw e;
+      }
+      
+      await sleep(1000); // Faster
+
+      // Add caption
+      log.info('Step 7: Adding caption', { caption });
+      try {
+        await typeIn(page, [
+          'textarea[aria-label="Write a caption…"]',
+          'textarea[aria-label="Write a caption..."]',
+          'textarea[placeholder="Write a caption..."]',
+          'textarea'
+        ], caption || '');
+        log.info('Step 7: ✅ Caption added');
+      } catch (e) {
+        log.error('Step 7: ❌ Could not add caption', { error: e instanceof Error ? e.message : String(e) });
+        await page.screenshot({ path: 'debug-step7.png' });
+        log.info('Screenshot saved as debug-step7.png');
+        // Don't throw - caption is optional
+      }
+
+      await sleep(1000); // Faster
+
+      // Final share
+      log.info('Step 8: Final share');
+      try {
+        await clickAny(page, [
+          'text=Share',
+          'xpath=//div[@role="button" and normalize-space()="Share"]',
+          'xpath=//button[normalize-space()="Share"]',
+          '[data-testid="share-button"]'
+        ], 'instagram-final-share');
+        log.info('Step 8: ✅ Final share clicked');
+      } catch (e) {
+        log.error('Step 8: ❌ Could not find final share button', { error: e instanceof Error ? e.message : String(e) });
+        await page.screenshot({ path: 'debug-step8.png' });
+        log.info('Screenshot saved as debug-step8.png');
+        throw e;
+      }
+      
+      await sleep(5000); // Faster final wait
       log.info('Instagram post triggered', { nickname });
     });
   }, 3, 750);
@@ -119,8 +228,16 @@ export async function postTikTok(userId: string, nickname: string, videoPath: st
   }, 3, 750);
 }
 
-async function clickAny(page: Page, selectors: string[]) {
-  for (const raw of selectors) {
+async function clickAny(page: Page, selectors: string[], cacheKey?: string) {
+  // Use cached successful selectors first
+  let orderedSelectors = selectors;
+  if (cacheKey && selectorCache.has(cacheKey)) {
+    const cached = selectorCache.get(cacheKey)!;
+    orderedSelectors = [...cached, ...selectors.filter(s => !cached.includes(s))];
+    log.info('Using cached selectors', { cacheKey, cached });
+  }
+
+  for (const raw of orderedSelectors) {
     try {
       if (raw.startsWith('text=')) {
         const term = raw.slice(5);
@@ -137,7 +254,14 @@ async function clickAny(page: Page, selectors: string[]) {
           return false;
         }, term);
         if (clicked) {
-          await sleep(700 + Math.random() * 400);
+          // Cache successful selector
+          if (cacheKey) {
+            const current = selectorCache.get(cacheKey) || [];
+            if (!current.includes(raw)) {
+              selectorCache.set(cacheKey, [raw, ...current.slice(0, 2)]); // Keep top 3
+            }
+          }
+          await sleep(300 + Math.random() * 200); // Faster but still human-like
           return;
         }
       } else if (raw.startsWith('xpath=')) {
@@ -152,7 +276,13 @@ async function clickAny(page: Page, selectors: string[]) {
           return false;
         }, expr);
         if (clicked) {
-          await sleep(700 + Math.random() * 400);
+          if (cacheKey) {
+            const current = selectorCache.get(cacheKey) || [];
+            if (!current.includes(raw)) {
+              selectorCache.set(cacheKey, [raw, ...current.slice(0, 2)]);
+            }
+          }
+          await sleep(300 + Math.random() * 200);
           return;
         }
       } else {
@@ -160,7 +290,13 @@ async function clickAny(page: Page, selectors: string[]) {
         const el = await page.$(selector);
         if (el) {
           await el.click();
-          await sleep(700 + Math.random() * 400);
+          if (cacheKey) {
+            const current = selectorCache.get(cacheKey) || [];
+            if (!current.includes(raw)) {
+              selectorCache.set(cacheKey, [raw, ...current.slice(0, 2)]);
+            }
+          }
+          await sleep(300 + Math.random() * 200);
           return;
         }
       }
