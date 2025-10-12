@@ -35,8 +35,6 @@ export class SupabaseAdapter implements DatabaseAdapter {
 
   constructor(url: string, key: string) {
     this.supabase = createClient(url, key);
-    this.syncCache.set('accounts_instagram', []);
-    this.syncCache.set('accounts_tiktok', []);
   }
 
   exec(sql: string) {
@@ -61,15 +59,16 @@ export class SupabaseAdapter implements DatabaseAdapter {
         }
         
         if (sql.includes('SELECT * FROM accounts') || sql.includes('select nickname, username from accounts')) {
+          const tgUserId = params[0]; // First parameter is tg_user_id
           const platform = params[1]; // Second parameter is platform
-          const cacheKey = `accounts_${platform}`;
+          const cacheKey = `accounts_${tgUserId}_${platform}`;
           
           const cached = this.syncCache.get(cacheKey) || [];
-          console.log(`Returning cached accounts for ${platform}:`, cached);
+          console.log(`Returning cached accounts for user ${tgUserId} platform ${platform}:`, cached);
           
           this.allQuery(sql, params).then(data => {
             this.syncCache.set(cacheKey, data || []);
-            console.log(`Updated cache for ${platform}:`, data);
+            console.log(`Updated cache for user ${tgUserId} platform ${platform}:`, data);
           }).catch(err => {
             console.error('Supabase allQuery error:', err);
             this.syncCache.set(cacheKey, []);
@@ -112,14 +111,15 @@ export class SupabaseAdapter implements DatabaseAdapter {
           return { changes: 1 }; // Pretend it worked
         }
         console.log('Supabase insert account success:', data);
+        this.updateAccountsCache(params[0], params[1]); // Update cache after successful insertion
         return { changes: data?.length || 0 };
       }
       
       if (sql.includes('UPDATE posts SET status')) {
         const { data, error } = await this.supabase
           .from('posts')
-          .update({ status: params.status })
-          .eq('id', params.id);
+          .update({ status: params[0] })
+          .eq('id', params[1]);
         if (error) throw error;
         return { changes: data?.length || 0 };
       }
@@ -127,8 +127,8 @@ export class SupabaseAdapter implements DatabaseAdapter {
       if (sql.includes('UPDATE posts SET schedule_at')) {
         const { data, error } = await this.supabase
           .from('posts')
-          .update({ schedule_at: params.schedule_at })
-          .eq('id', params.id);
+          .update({ schedule_at: params[0] })
+          .eq('id', params[1]);
         if (error) throw error;
         return { changes: data?.length || 0 };
       }
@@ -136,8 +136,8 @@ export class SupabaseAdapter implements DatabaseAdapter {
       if (sql.includes('UPDATE posts SET retry_count')) {
         const { data, error } = await this.supabase
           .from('posts')
-          .update({ retry_count: params.retry_count })
-          .eq('id', params.id);
+          .update({ retry_count: params[0] })
+          .eq('id', params[1]);
         if (error) throw error;
         return { changes: data?.length || 0 };
       }
@@ -147,6 +147,17 @@ export class SupabaseAdapter implements DatabaseAdapter {
           .from('posts')
           .delete()
           .eq('tg_user_id', params);
+        if (error) throw error;
+        return { changes: data?.length || 0 };
+      }
+
+      if (sql.includes('DELETE FROM accounts')) {
+        const { data, error } = await this.supabase
+          .from('accounts')
+          .delete()
+          .eq('tg_user_id', params[0])
+          .eq('platform', params[1])
+          .eq('nickname', params[2]);
         if (error) throw error;
         return { changes: data?.length || 0 };
       }
@@ -267,10 +278,32 @@ export class SupabaseAdapter implements DatabaseAdapter {
       schedule_type: params[8],
       schedule_at: params[9],
       every_hours: params[10],
-      status: params[11],
-      created_at: params[12],
-      retry_count: params[13] || 0
+      status: 'queued', // Always set to 'queued' for new posts
+      created_at: params[11],
+      retry_count: 0
     };
+  }
+
+  private async updateAccountsCache(tgUserId: string, platform: string) {
+    try {
+      const { data, error } = await this.supabase
+        .from('accounts')
+        .select('nickname, username')
+        .eq('tg_user_id', tgUserId)
+        .eq('platform', platform)
+        .order('created_at', { ascending: false });
+      
+      if (error) {
+        console.error('Supabase cache update error:', error);
+        return;
+      }
+      
+      const cacheKey = `accounts_${tgUserId}_${platform}`;
+      this.syncCache.set(cacheKey, data || []);
+      console.log(`Updated cache for user ${tgUserId} platform ${platform}:`, data);
+    } catch (err) {
+      console.error('Error updating accounts cache:', err);
+    }
   }
 }
 

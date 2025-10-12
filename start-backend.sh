@@ -23,15 +23,18 @@ if [ -z "$TELEGRAM_BOT_TOKEN" ]; then
     exit 1
 fi
 
-if [ -z "$SUPABASE_URL" ]; then
-    echo "❌ SUPABASE_URL not set in .env file"
-    exit 1
+# Check if using Supabase (optional)
+if [ -n "$SUPABASE_URL" ] && [ -n "$SUPABASE_KEY" ]; then
+    echo "✅ Using Supabase database"
+elif [ -n "$DATABASE_URL" ]; then
+    echo "✅ Using PostgreSQL database"
+else
+    echo "✅ Using SQLite database (local)"
 fi
 
-if [ -z "$SUPABASE_KEY" ]; then
-    echo "❌ SUPABASE_KEY not set in .env file"
-    exit 1
-fi
+# Install dependencies first
+echo "📦 Installing dependencies..."
+npm install
 
 # Build the project
 echo "🔨 Building project..."
@@ -40,10 +43,6 @@ npm run build
 # Create necessary directories
 echo "📁 Creating directories..."
 mkdir -p uploads sessions logs
-
-# Install dependencies if needed
-echo "📦 Installing dependencies..."
-npm install
 
 # Start the services with PM2
 echo "🚀 Starting services with PM2..."

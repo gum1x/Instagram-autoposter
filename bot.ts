@@ -27,7 +27,8 @@ create table if not exists posts(
   schedule_at text,
   every_hours integer,
   status text default 'queued',
-  created_at text
+  created_at text,
+  retry_count integer default 0
 );
 create table if not exists settings(
   tg_user_id text primary key,
