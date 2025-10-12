@@ -8,6 +8,7 @@ module.exports = {
       watch: false,
       max_memory_restart: '1G',
       restart_delay: 5000,
+      env_file: '.env',
       env: {
         NODE_ENV: 'production',
         HEADLESS: 'true'
@@ -24,6 +25,7 @@ module.exports = {
       autorestart: true,
       watch: false,
       max_memory_restart: '512M',
+      env_file: '.env',
       env: {
         NODE_ENV: 'production'
       },

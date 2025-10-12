@@ -81,35 +81,107 @@ export async function loginToInstagram(credentials: LoginCredentials): Promise<L
       // Navigate to Instagram login page
       log.info('Navigating to Instagram login page');
       try {
-        await page.goto('https://www.instagram.com/accounts/login/', { 
-          waitUntil: 'networkidle2',
-          timeout: 30000 
-        });
+        // Try multiple Instagram URLs
+        const urls = [
+          'https://www.instagram.com/accounts/login/',
+          'https://instagram.com/accounts/login/',
+          'https://www.instagram.com/'
+        ];
+        
+        let navigationSuccess = false;
+        for (const url of urls) {
+          try {
+            log.info(`Trying URL: ${url}`);
+            await page.goto(url, { 
+              waitUntil: 'networkidle2',
+              timeout: 30000 
+            });
+            navigationSuccess = true;
+            log.info(`Successfully navigated to: ${url}`);
+            break;
+          } catch (urlError) {
+            log.warn(`Failed to navigate to ${url}:`, urlError.message);
+            continue;
+          }
+        }
+        
+        if (!navigationSuccess) {
+          throw new Error('Failed to navigate to any Instagram URL. Check your network connection.');
+        }
+        
         await new Promise(resolve => setTimeout(resolve, 2000));
-        log.info('Successfully navigated to Instagram login page');
       } catch (navError) {
         log.error('Navigation failed:', navError);
         await browser.close();
-        resolve({ success: false, error: `Navigation failed: ${navError.message}` });
+        resolve({ success: false, error: `Navigation failed: ${navError.message}. Please check your network connection and try again.` });
         return;
       }
 
       // Fill username
       log.info('Filling username');
-      await page.waitForSelector('input[name="username"]', { timeout: 10000 });
-      await page.type('input[name="username"]', credentials.username);
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      try {
+        await page.waitForSelector('input[name="username"]', { timeout: 15000 });
+        await page.click('input[name="username"]'); // Click to focus
+        await page.type('input[name="username"]', credentials.username, { delay: 100 });
+        await new Promise(resolve => setTimeout(resolve, 1500));
+        log.info('Username filled successfully');
+      } catch (error) {
+        log.error('Failed to fill username:', error);
+        await browser.close();
+        resolve({ success: false, error: 'Failed to fill username field' });
+        return;
+      }
 
       // Fill password
       log.info('Filling password');
-      await page.waitForSelector('input[name="password"]', { timeout: 10000 });
-      await page.type('input[name="password"]', credentials.password);
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      try {
+        await page.waitForSelector('input[name="password"]', { timeout: 15000 });
+        await page.click('input[name="password"]'); // Click to focus
+        await page.type('input[name="password"]', credentials.password, { delay: 100 });
+        await new Promise(resolve => setTimeout(resolve, 1500));
+        log.info('Password filled successfully');
+      } catch (error) {
+        log.error('Failed to fill password:', error);
+        await browser.close();
+        resolve({ success: false, error: 'Failed to fill password field' });
+        return;
+      }
 
       // Click login button
       log.info('Clicking login button');
-      await page.click('button[type="submit"]');
-      await new Promise(resolve => setTimeout(resolve, 3000));
+      try {
+        await page.waitForSelector('button[type="submit"]', { timeout: 10000 });
+        await page.click('button[type="submit"]');
+        log.info('Login button clicked');
+        
+        // Wait longer for the page to process
+        await new Promise(resolve => setTimeout(resolve, 5000));
+        
+        // Check for any error messages
+        const errorElement = await page.$('[role="alert"]');
+        if (errorElement) {
+          const errorText = await page.evaluate(el => el.textContent, errorElement);
+          log.error('Login error detected:', errorText);
+          await browser.close();
+          resolve({ success: false, error: errorText || 'Login failed - invalid credentials' });
+          return;
+        }
+        
+        // Check for CAPTCHA
+        const captchaElement = await page.$('iframe[src*="recaptcha"]');
+        if (captchaElement) {
+          log.error('CAPTCHA detected');
+          await browser.close();
+          resolve({ success: false, error: 'CAPTCHA required - please try again later' });
+          return;
+        }
+        
+      } catch (error) {
+        log.error('Failed to click login button:', error);
+        await browser.close();
+        resolve({ success: false, error: 'Failed to click login button' });
+        return;
+      }
 
       // Check if we need 2FA
       const twoFactorSelector = 'input[name="verificationCode"]';
@@ -148,13 +220,42 @@ export async function loginToInstagram(credentials: LoginCredentials): Promise<L
       }
 
       // Wait for successful login (check if we're redirected to home page)
-      await new Promise(resolve => setTimeout(resolve, 3000));
+      await new Promise(resolve => setTimeout(resolve, 5000));
       const currentUrl = page.url();
       
+      log.info('Current URL after login attempt:', currentUrl);
+      
+      // Check if we're still on login page
       if (currentUrl.includes('/accounts/login')) {
+        // Check for specific error messages
+        const errorMessages = await page.evaluate(() => {
+          const alerts = document.querySelectorAll('[role="alert"]');
+          return Array.from(alerts).map(el => el.textContent).filter(text => text && text.trim());
+        });
+        
+        if (errorMessages.length > 0) {
+          log.error('Login error messages found:', errorMessages);
+          await browser.close();
+          resolve({ success: false, error: errorMessages[0] || 'Login failed - invalid credentials' });
+          return;
+        }
+        
+        // Check for suspicious activity message
+        const suspiciousText = await page.evaluate(() => {
+          const body = document.body.textContent || '';
+          return body.includes('suspicious') || body.includes('unusual') || body.includes('verify');
+        });
+        
+        if (suspiciousText) {
+          log.error('Suspicious activity detected');
+          await browser.close();
+          resolve({ success: false, error: 'Suspicious activity detected - please try again later' });
+          return;
+        }
+        
         log.error('Still on login page, login may have failed');
         await browser.close();
-        resolve({ success: false, error: 'Login failed - still on login page' });
+        resolve({ success: false, error: 'Login failed - still on login page. Please check your credentials.' });
         return;
       }
 
