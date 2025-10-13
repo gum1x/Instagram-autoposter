@@ -2,6 +2,8 @@ import puppeteer from 'puppeteer-extra';
 // Stealth to reduce bot detection
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import { createLogger } from './utils.js';
+import { promises as fs } from 'fs';
+import path from 'path';
 
 const log = createLogger('instagram-login');
 puppeteer.use(StealthPlugin());
@@ -234,31 +236,92 @@ export async function loginToInstagram(credentials: LoginCredentials): Promise<L
         return;
       }
 
-      // Check if we need 2FA (multiple selector variants)
+      // Check if we need 2FA (include multi-input OTP variants)
       const twoFactorSelectors = [
         'input[name="verificationCode"]',
         'input[aria-label="Security code"]',
-        'input[name="code"]'
+        'input[name="code"]',
+        'input[autocomplete="one-time-code"]',
+        'input[type="tel"][inputmode="numeric"]',
+        'input[name="otp"]'
       ];
       let twoFactorSelector: string | null = null;
       for (const sel of twoFactorSelectors) {
         if (await page.$(sel)) { twoFactorSelector = sel; break; }
       }
-      const twoFactorExists = !!twoFactorSelector;
+      const multiOtpSelectors = [
+        'input[data-testid="verification-code-input"] input',
+        'div[role="dialog"] input[type="text"][maxlength="1"]',
+        'input[name^="digit"]',
+        'input[aria-label="digit"]'
+      ];
+      let multiOtpNodes: any[] = [];
+      for (const sel of multiOtpSelectors) {
+        const nodes = await page.$$(sel);
+        if (nodes && nodes.length >= 4) { multiOtpNodes = nodes; break; }
+      }
+      const twoFactorExists = !!twoFactorSelector || multiOtpNodes.length > 0;
       
       if (twoFactorExists) {
         log.info('2FA required');
         
         if (credentials.twoFactorCode) {
           log.info('Using provided 2FA code');
-          await page.type(twoFactorSelector!, credentials.twoFactorCode, { delay: 80 });
-          await new Promise(resolve => setTimeout(resolve, 1000));
-          
-          // Click submit for 2FA
+          // Prefer a fast method if the UI asks (auth app or SMS)
+          try {
+            const methodButtons = [
+              'button:has-text("Authentication app")',
+              'button:has-text("Use authentication app")',
+              'button:has-text("Text message")',
+              'button:has-text("Send code")',
+              'div[role="dialog"] button:has-text("Authentication app")',
+              'div[role="dialog"] button:has-text("Text message")'
+            ];
+            for (const sel of methodButtons) {
+              const btn = await page.$(sel as any);
+              if (btn) { await btn.click(); await page.waitForTimeout(300); break; }
+            }
+          } catch {}
+          const code = credentials.twoFactorCode.replace(/\s+/g, '').trim();
+          if (multiOtpNodes.length > 0 && code.length >= multiOtpNodes.length) {
+            for (let i = 0; i < multiOtpNodes.length && i < code.length; i++) {
+              try { await multiOtpNodes[i].focus(); } catch {}
+              await multiOtpNodes[i].type(code[i], { delay: 0 });
+            }
+          } else if (twoFactorSelector) {
+            await page.focus(twoFactorSelector);
+            await page.type(twoFactorSelector, code, { delay: 0 });
+          }
+          try { await page.keyboard.press('Enter'); } catch {}
+          await new Promise(resolve => setTimeout(resolve, 1200));
           const submitButton = await page.$('button[type="submit"]');
           if (submitButton) {
             await submitButton.click();
-            await new Promise(resolve => setTimeout(resolve, 5000));
+            await Promise.race([
+              page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 6000 }).catch(() => {}),
+              page.waitForTimeout(1200)
+            ]);
+          }
+
+          // If still on login/code screen, try a visible Continue/Verify once
+          if (page.url().includes('/accounts/login')) {
+            const retrySelectors = [
+              'button[type="submit"]',
+              'button:has-text("Continue")',
+              'button:has-text("Verify")',
+              'button:has-text("Not now")'
+            ];
+            for (const sel of retrySelectors) {
+              const btn = await page.$(sel as any);
+              if (btn) {
+                await btn.click();
+                await Promise.race([
+                  page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 6000 }).catch(() => {}),
+                  page.waitForTimeout(1500)
+                ]);
+                break;
+              }
+            }
           }
         } else {
           log.info('2FA code required but not provided');
@@ -293,7 +356,7 @@ export async function loginToInstagram(credentials: LoginCredentials): Promise<L
       } catch {}
 
       // Check for login errors
-      const errorElement = await page.$('[role="alert"]');
+      const errorElement = await page.$('[role="alert"], [data-testid="alert"], div[role="dialog"] [role="alert"]');
       if (errorElement) {
         const errorText = await page.evaluate(el => el.textContent, errorElement);
         log.error('Login error detected', { error: errorText });
@@ -312,7 +375,7 @@ export async function loginToInstagram(credentials: LoginCredentials): Promise<L
       if (currentUrl.includes('/accounts/login')) {
         // Check for specific error messages
         const errorMessages = await page.evaluate(() => {
-          const alerts = document.querySelectorAll('[role="alert"]');
+          const alerts = document.querySelectorAll('[role="alert"], [data-testid="alert"], .x1i10hfl');
           return Array.from(alerts).map(el => el.textContent).filter(text => text && text.trim());
         });
         
@@ -326,7 +389,7 @@ export async function loginToInstagram(credentials: LoginCredentials): Promise<L
         // Check for suspicious activity message
         const suspiciousText = await page.evaluate(() => {
           const body = document.body.textContent || '';
-          return body.includes('suspicious') || body.includes('unusual') || body.includes('verify');
+          return /suspicious|unusual|verify|confirm/i.test(body);
         });
         
         if (suspiciousText) {
@@ -336,9 +399,20 @@ export async function loginToInstagram(credentials: LoginCredentials): Promise<L
           return;
         }
         
-        log.error('Still on login page, login may have failed');
+        // Save diagnostics for analysis (screenshot + HTML)
+        try {
+          const dir = path.join(process.cwd(), 'temp');
+          try { await fs.mkdir(dir, { recursive: true }); } catch {}
+          const ts = Date.now();
+          const png = path.join(dir, `ig-2fa-fail-${ts}.png`);
+          const html = path.join(dir, `ig-2fa-fail-${ts}.html`);
+          await page.screenshot({ path: png, fullPage: true });
+          const content = await page.content();
+          await fs.writeFile(html, content, 'utf8');
+          log.error('Saved 2FA failure diagnostics', { png, html });
+        } catch (e) { log.warn('Failed to save diagnostics', { e }); }
         await browser.close();
-        resolve({ success: false, error: 'Login failed - still on login page. Please check your credentials.' });
+        resolve({ success: false, error: 'Login failed - still on login page. 2FA may be expired/invalid or a checkpoint blocked. See temp/ diagnostics.' });
         return;
       }
 
