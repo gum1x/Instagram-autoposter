@@ -43,9 +43,9 @@ export class SupabaseAdapter implements DatabaseAdapter {
 
   prepare(sql: string) {
     return {
-      run: (...params: any[]) => this.runQuery(sql, params),
-      get: (...params: any[]) => this.getQuery(sql, params),
-      all: (...params: any[]) => {
+      run: async (...params: any[]) => await this.runQuery(sql, params),
+      get: async (...params: any[]) => await this.getQuery(sql, params),
+      all: async (...params: any[]) => {
         if (sql.includes('pragma table_info(accounts)')) {
           return [
             { name: 'id' },

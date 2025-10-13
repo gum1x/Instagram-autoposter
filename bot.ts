@@ -1,12 +1,12 @@
 import 'dotenv/config';
 import { Telegraf, Markup } from 'telegraf';
-import * as fs from 'fs';
 import * as path from 'path';
 import { createDatabase, DatabaseAdapter } from './database.js';
 import { v4 as uuid } from 'uuid';
 import dayjs from 'dayjs';
 import { fetchInstagramStats, fetchTikTokStats, StatsSnapshot, formatStats } from './stats.js';
 import { cookieFilePath, createLogger, ensureEnv, writeEncryptedJson } from './utils.js';
+import { storageSave } from './storage.js';
 
 ensureEnv(['TELEGRAM_BOT_TOKEN', 'ENCRYPTION_KEY']);
 const BOT = new Telegraf(process.env.TELEGRAM_BOT_TOKEN!);
@@ -30,6 +30,7 @@ create table if not exists posts(
   created_at text,
   retry_count integer default 0
 );
+alter table posts disable row level security;
 create table if not exists settings(
   tg_user_id text primary key,
   default_hashtags text,
@@ -45,6 +46,7 @@ create table if not exists accounts(
   cookie_path text,
   created_at text
 );
+alter table accounts disable row level security;
 `);
 
 const accountColumns = db.prepare(`pragma table_info(accounts)`).all() as { name: string }[];
@@ -74,7 +76,7 @@ const lastScheduledForUser = db.prepare(`
 const insertPost = db.prepare(`insert into posts(id,tg_user_id,platform,ig_account,tt_account,video_path,caption,hashtags,schedule_type,schedule_at,every_hours,status,created_at)
   values(?,?,?,?,?,?,?,?,?,?,?,'queued',?)`);
 
-type AccountSetupStage = 'username'|'nickname'|'password'|'login'|'twofa';
+type AccountSetupStage = 'username'|'nickname'|'password'|'twofa'|'login'|'cookies';
 type Session = {
   files: string[];
   platform?: 'instagram'|'tiktok'|'both';
@@ -94,8 +96,6 @@ type Session = {
     nickname?: string;
     password?: string;
     twoFactorCode?: string;
-    twoFactorToken?: string;
-    loginInProgress?: boolean;
   };
 };
 const sessions = new Map<number, Session>();
@@ -126,10 +126,9 @@ BOT.on('video', async (ctx) => {
     const file = await ctx.telegram.getFile(ctx.message.video.file_id);
     const url = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
     const dest = path.join('uploads', `${ctx.message.video.file_id}.mp4`);
-    fs.mkdirSync('uploads', { recursive: true });
     const res = await fetch(url);
     const buf = Buffer.from(await res.arrayBuffer());
-    fs.writeFileSync(dest, buf);
+    await storageSave(dest, buf, { contentType: 'video/mp4' });
     s.files.push(dest);
     sessions.set(ctx.from.id, s);
     await ctx.reply(`✅ Success saved video (${s.files.length}). Send more or type "done".`);
@@ -146,10 +145,9 @@ BOT.on('photo', async (ctx) => {
     const file = await ctx.telegram.getFile(photo.file_id);
     const url = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
     const dest = path.join('uploads', `${photo.file_id}.jpg`);
-    fs.mkdirSync('uploads', { recursive: true });
     const res = await fetch(url);
     const buf = Buffer.from(await res.arrayBuffer());
-    fs.writeFileSync(dest, buf);
+    await storageSave(dest, buf, { contentType: 'image/jpeg' });
     s.files.push(dest);
     sessions.set(ctx.from.id, s);
     await ctx.reply(`✅ Success saved photo (${s.files.length}). Send more or type "done".`);
@@ -179,10 +177,9 @@ BOT.on('document', async (ctx) => {
     else if (document.mime_type === 'image/webp') ext = '.webp';
     
     const dest = path.join('uploads', `${document.file_id}${ext}`);
-    fs.mkdirSync('uploads', { recursive: true });
     const res = await fetch(url);
     const buf = Buffer.from(await res.arrayBuffer());
-    fs.writeFileSync(dest, buf);
+    await storageSave(dest, buf, { contentType: document.mime_type || 'application/octet-stream' });
     s.files.push(dest);
     sessions.set(ctx.from.id, s);
     await ctx.reply(`✅ Success saved image file (${s.files.length}). Send more or type "done".`);
@@ -205,151 +202,67 @@ BOT.on('text', async (ctx) => {
 
   if (s.accountSetup) {
     if (s.accountSetup.stage === 'username') {
-      const username = text.replace(/^@/, '').trim();
-      if (!username) {
-        await ctx.reply('Please send a username (letters, numbers, underscores).');
+      const parts = text.trim().split(/\s+/);
+      if (parts.length < 2) {
+        await ctx.reply('❌ Please send: `username password 2fa_code` (or `username password skip` if no 2FA)');
         return;
       }
-      s.accountSetup.username = username;
-      s.accountSetup.stage = 'nickname';
-      sessions.set(ctx.from.id, s);
-      await ctx.reply('Add a nickname for quick selection (e.g., "brand_main").');
-      return;
-    }
-    if (s.accountSetup.stage === 'nickname') {
-      const nickname = text.trim() || s.accountSetup.username!;
-      const normalized = ['skip', 'same'].includes(nickname.toLowerCase())
-        ? s.accountSetup.username!
-        : nickname;
-      s.accountSetup.nickname = normalized;
-      s.accountSetup.stage = 'password';
-      sessions.set(ctx.from.id, s);
-      await ctx.reply(`Enter ${s.accountSetup.platform === 'instagram' ? 'Instagram' : 'TikTok'} password for @${s.accountSetup.username}:`, 
-        Markup.inlineKeyboard([
-          [Markup.button.callback('❓ Help - Login Process', 'login_help')]
-        ])
-      );
-      return;
-    }
-    if (s.accountSetup.stage === 'password') {
-      // If a two-factor flow is already pending, do NOT re-login
-      if (s.accountSetup.twoFactorToken) {
-        s.accountSetup.stage = 'twofa';
-        sessions.set(ctx.from.id, s);
-        await ctx.reply('2FA is already required. Please enter the 6-digit code.');
-        return;
-      }
-      s.accountSetup.password = text;
-      sessions.set(ctx.from.id, s);
-      if (s.accountSetup.loginInProgress) {
-        await ctx.reply('Login already in progress...');
-        return;
-      }
-      s.accountSetup.loginInProgress = true;
-      sessions.set(ctx.from.id, s);
-      await ctx.reply('🔐 Logging in... This may take a moment. Please wait.');
       
-      // Import the login function
-      const { loginToInstagram } = await import('./instagram-login.js');
+      s.accountSetup.username = parts[0].replace(/^@/, '');
+      s.accountSetup.password = parts[1];
+      s.accountSetup.twoFactorCode = parts[2] === 'skip' ? undefined : parts[2];
+      s.accountSetup.nickname = s.accountSetup.username; // Use username as default nickname
+      s.accountSetup.stage = 'login';
+      sessions.set(ctx.from.id, s);
       
-      try {
-        const result = await loginToInstagram({
-          username: s.accountSetup.username!,
-          password: s.accountSetup.password!,
-          twoFactorCode: undefined
-        });
+      await ctx.reply('🔐 Logging in with all credentials...');
+      
+      if (s.accountSetup.platform === 'instagram') {
+        // Use instagrapi service for Instagram login
+        const { InstagrapiClient } = await import('./instagrapi-client.js');
+        const ig = new InstagrapiClient();
         
-        if (result.success && result.cookies) {
-          // Save the cookies
-          const file = cookieFilePath(s.accountSetup.platform, ctx.from.id, s.accountSetup.nickname!);
-          fs.mkdirSync(path.dirname(file), { recursive: true });
-          writeEncryptedJson(file, result.cookies);
+        try {
+          const result = await ig.login({
+            username: s.accountSetup.username!,
+            password: s.accountSetup.password!,
+            verification_code: s.accountSetup.twoFactorCode
+          });
           
-          // Save to database
-          deleteAccount.run(String(ctx.from.id), s.accountSetup.platform, s.accountSetup.nickname!);
-          addAccount.run(String(ctx.from.id), s.accountSetup.platform, s.accountSetup.nickname!, s.accountSetup.username!, file, dayjs().toISOString());
-          
-          await ctx.reply(`✅ Successfully logged in and saved ${s.accountSetup.platform} account "${s.accountSetup.nickname}".`, mainMenu());
-          log.info('Account setup completed', { platform: s.accountSetup.platform, nickname: s.accountSetup.nickname, userId: ctx.from.id });
-          
-          delete s.accountSetup;
-          sessions.set(ctx.from.id, s);
-        } else if (result.needs2FA) {
-          s.accountSetup.stage = 'twofa';
-          s.accountSetup.twoFactorToken = result.token as any;
-          s.accountSetup.loginInProgress = false;
-          sessions.set(ctx.from.id, s);
-          await ctx.reply('⏳ Waiting for 2FA code... send the 6-digit code now.');
-        } else {
-          await ctx.reply(`❌ Login failed: ${result.error || 'Unknown error'}\n\nPlease try again with /add_account.`);
-          delete s.accountSetup;
-          sessions.set(ctx.from.id, s);
+          if (result.success && result.settings) {
+            // Save settings JSON instead of cookies
+            const file = cookieFilePath(s.accountSetup.platform, ctx.from.id, s.accountSetup.nickname!);
+            await writeEncryptedJson(file, result.settings);
+            
+            // Save to database
+            deleteAccount.run(String(ctx.from.id), s.accountSetup.platform, s.accountSetup.nickname!);
+            addAccount.run(String(ctx.from.id), s.accountSetup.platform, s.accountSetup.nickname!, s.accountSetup.username!, file, dayjs().toISOString());
+            
+            await ctx.reply(`✅ Successfully logged in and saved ${s.accountSetup.platform} account "${s.accountSetup.nickname}".`, mainMenu());
+            log.info('Account setup completed with instagrapi', { platform: s.accountSetup.platform, nickname: s.accountSetup.nickname, userId: ctx.from.id });
+          } else {
+            await ctx.reply(`❌ Login failed: ${result.detail || 'Unknown error'}\n\nPlease try again with /add_account.`);
+          }
+        } catch (error) {
+          await ctx.reply(`❌ Login failed: ${error instanceof Error ? error.message : String(error)}\n\nPlease try again with /add_account.`);
+          log.error('Login failed during account setup', { error: error instanceof Error ? error.message : String(error), userId: ctx.from.id });
         }
-      } catch (error) {
-        await ctx.reply(`❌ Login failed: ${error instanceof Error ? error.message : String(error)}\n\nPlease try again with /add_account.`);
-        log.error('Login failed during account setup', { error: error instanceof Error ? error.message : String(error), userId: ctx.from.id });
-        delete s.accountSetup;
+      } else if (s.accountSetup.platform === 'tiktok') {
+        // For TikTok, still use cookie method but with fast setup
+        await ctx.reply(`⚠️ TikTok login requires cookies.\n\nPlease paste your TikTok cookies (JSON or tab-separated format from browser dev tools).\n\nAccount: @${s.accountSetup.username}\nNickname: ${s.accountSetup.nickname}`);
+        s.accountSetup.stage = 'cookies';
         sessions.set(ctx.from.id, s);
-      } finally {
-        const cur = sessions.get(ctx.from.id);
-        if (cur?.accountSetup) cur.accountSetup.loginInProgress = false;
-        sessions.set(ctx.from.id, cur || s);
+        return;
       }
+      
+      delete s.accountSetup;
+      sessions.set(ctx.from.id, s);
       return;
     }
-    if (s.accountSetup.stage === 'twofa') {
-      // Ignore any non-6-digit messages while waiting for 2FA
-      if (!/^\d{6}$/.test(text)) {
-        await ctx.reply('⏳ Waiting for 2FA code. Send the 6-digit code.');
-        return;
-      }
-      const code = text.trim();
-      // By this point it is a valid 6-digit
-      
-      s.accountSetup.twoFactorCode = code;
-      sessions.set(ctx.from.id, s);
-      await ctx.reply('🔐 Submitting 2FA code...');
-
-      // Import 2FA submitter
-      const { submitTwoFactor } = await import('./instagram-login.js');
-
-      try {
-        const token = s.accountSetup.twoFactorToken as any;
-        if (!token) {
-          await ctx.reply('Session expired. Send /add_account again.');
-          delete s.accountSetup;
-          sessions.set(ctx.from.id, s);
-          return;
-        }
-        const result = await submitTwoFactor(token, s.accountSetup.twoFactorCode!);
-        
-        if (result.success && result.cookies) {
-          // Save the cookies
-          const file = cookieFilePath(s.accountSetup.platform, ctx.from.id, s.accountSetup.nickname!);
-          fs.mkdirSync(path.dirname(file), { recursive: true });
-          writeEncryptedJson(file, result.cookies);
-          
-          // Save to database
-          deleteAccount.run(String(ctx.from.id), s.accountSetup.platform, s.accountSetup.nickname!);
-          addAccount.run(String(ctx.from.id), s.accountSetup.platform, s.accountSetup.nickname!, s.accountSetup.username!, file, dayjs().toISOString());
-          
-          await ctx.reply(`✅ Successfully logged in and saved ${s.accountSetup.platform} account "${s.accountSetup.nickname}".`, mainMenu());
-          log.info('Account setup completed with 2FA', { platform: s.accountSetup.platform, nickname: s.accountSetup.nickname, userId: ctx.from.id });
-        } else {
-          await ctx.reply(`❌ 2FA failed: ${result.error || 'Unknown error'}. Send a fresh code to try again.`);
-          // Keep stage and token so user can retry without restarting
-          s.accountSetup!.stage = 'twofa';
-          sessions.set(ctx.from.id, s);
-          return;
-        }
-      } catch (error) {
-        await ctx.reply(`❌ 2FA error: ${error instanceof Error ? error.message : String(error)}. Send a new code to retry.`);
-        s.accountSetup!.stage = 'twofa';
-        sessions.set(ctx.from.id, s);
-        return;
-        log.error('2FA login failed during account setup', { error: error instanceof Error ? error.message : String(error), userId: ctx.from.id });
-      }
-      
+    
+    if (s.accountSetup.stage === 'cookies') {
+      // Handle TikTok cookie saving
+      await saveCookies(ctx, s.accountSetup.platform, s.accountSetup.username!, s.accountSetup.nickname!, text);
       delete s.accountSetup;
       sessions.set(ctx.from.id, s);
       return;
@@ -433,6 +346,7 @@ BOT.on('text', async (ctx) => {
   }
 
   if (s.expecting === 'caption') {
+    console.log('Caption received for user:', ctx.from.id, 'text:', ctx.message.text);
     s.caption = lower === 'skip' ? '' : ctx.message.text;
     s.expecting = 'hashtags';
     sessions.set(ctx.from.id, s);
@@ -441,6 +355,7 @@ BOT.on('text', async (ctx) => {
   }
 
   if (s.expecting === 'hashtags') {
+    console.log('Hashtags received for user:', ctx.from.id, 'text:', ctx.message.text);
     if (lower === 'defaults') {
       const set = getSettings.get(String(ctx.from.id));
       s.hashtags = set?.default_hashtags || '#fyp,#viral';
@@ -449,6 +364,7 @@ BOT.on('text', async (ctx) => {
     }
     s.expecting = undefined;
     sessions.set(ctx.from.id, s);
+    console.log('About to persist posts for user:', ctx.from.id, 'session:', s);
     const summary = await persistScheduledPosts(ctx.from.id, s);
     await ctx.reply(summary, mainMenu());
     sessions.delete(ctx.from.id);
@@ -521,7 +437,10 @@ async function maybeAskWhen(ctx:any, s:Session){
   }
 }
 
-BOT.action('w_now', async (ctx)=>{ await chooseWhen(ctx,'now'); });
+BOT.action('w_now', async (ctx)=>{ 
+  console.log('Post Now clicked for user:', ctx.from.id);
+  await chooseWhen(ctx,'now'); 
+});
 BOT.action('w_2h', async (ctx)=>{ await chooseWhen(ctx,'after2h'); });
 BOT.action('w_tomorrow', async (ctx)=>{ await chooseWhen(ctx,'tomorrow'); });
 BOT.action('w_at', async (ctx)=>{ await chooseWhen(ctx,'at'); });
@@ -532,6 +451,7 @@ async function chooseWhen(ctx:any, w:'now'|'after2h'|'tomorrow'|'at'|'everyXh'|'
   const s = sessions.get(ctx.from.id) || { files: [] };
   s.when = w;
   sessions.set(ctx.from.id, s);
+  console.log('chooseWhen called:', w, 'for user:', ctx.from.id, 'files:', s.files?.length);
   await ctx.answerCbQuery();
   
   if (w === 'at') {
@@ -560,9 +480,11 @@ async function chooseWhen(ctx:any, w:'now'|'after2h'|'tomorrow'|'at'|'everyXh'|'
 }
 
 async function persistScheduledPosts(userId:number, s:Session){
+  console.log('persistScheduledPosts called for user:', userId, 'session:', s);
   const uid = String(userId);
   const settings = getSettings.get(uid) as any;
   const files = s.files || [];
+  console.log('Files to process:', files.length, files);
   if (!files.length) {
     return '⚠️ No files queued.';
   }
@@ -613,20 +535,38 @@ async function persistScheduledPosts(userId:number, s:Session){
 
   for (let i = 0; i < files.length; i++) {
     const slot = scheduledTimes[i];
-    insertPost.run(
-      uuid(),
-      uid,
+    const postId = uuid();
+    console.log('Inserting post:', {
+      id: postId,
+      userId: uid,
       platform,
-      s.igAccount || null,
-      s.ttAccount || null,
-      files[i],
-      s.caption ?? '',
-      s.hashtags ?? '',
-      when === 'everyXh' ? 'everyXh' : 'at',
-      slot.toISOString(),
-      everyH ?? null,
-      dayjs().toISOString()
-    );
+      igAccount: s.igAccount,
+      file: files[i],
+      caption: s.caption,
+      hashtags: s.hashtags,
+      scheduleAt: slot.toISOString()
+    });
+    
+    try {
+      const result = await insertPost.run(
+        postId,
+        uid,
+        platform,
+        s.igAccount || null,
+        s.ttAccount || null,
+        files[i],
+        s.caption ?? '',
+        s.hashtags ?? '',
+        when === 'everyXh' ? 'everyXh' : 'at',
+        slot.toISOString(),
+        everyH ?? null,
+        dayjs().toISOString()
+      );
+      console.log('Post insert result:', result);
+      console.log('Post inserted successfully:', postId);
+    } catch (error) {
+      console.error('Error inserting post:', error);
+    }
   }
 
   const firstSlot = scheduledTimes[0];
@@ -648,14 +588,14 @@ BOT.action('acc_add_ig', async (ctx)=>{
   const s = sessions.get(ctx.from!.id) || { files: [] };
   s.accountSetup = { platform: 'instagram', stage: 'username' };
   sessions.set(ctx.from!.id, s);
-  await ctx.reply('Send the Instagram username (without @).');
+  await ctx.reply('🔐 **Quick Instagram Setup**\n\nSend your Instagram credentials in this format:\n\n`username password 2fa_code`\n\nExample: `myusername mypassword 123456`\n\nIf no 2FA, use: `myusername mypassword skip`');
 });
 BOT.action('acc_add_tt', async (ctx)=>{
   await ctx.answerCbQuery();
   const s = sessions.get(ctx.from!.id) || { files: [] };
   s.accountSetup = { platform: 'tiktok', stage: 'username' };
   sessions.set(ctx.from!.id, s);
-  await ctx.reply('Send the TikTok username (without @).');
+  await ctx.reply('🔐 **Quick TikTok Setup**\n\nSend your TikTok credentials in this format:\n\n`username password 2fa_code`\n\nExample: `myusername mypassword 123456`\n\nIf no 2FA, use: `myusername mypassword skip`');
 });
 
 BOT.action('acc_list_ig', async (ctx)=>{
@@ -698,8 +638,7 @@ async function saveCookies(ctx:any, platform:'instagram'|'tiktok', username:stri
     }
     
     const file = cookieFilePath(platform, ctx.from.id, nickname);
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    writeEncryptedJson(file, cookies);
+    await writeEncryptedJson(file, cookies);
     deleteAccount.run(String(ctx.from.id), platform, nickname);
     addAccount.run(String(ctx.from.id), platform, nickname, username, file, dayjs().toISOString());
     await ctx.reply(`✅ Saved cookies for ${platform} account "${nickname}".`, mainMenu());
@@ -940,8 +879,7 @@ BOT.action('save_cookies_anyway', async (ctx) => {
   const s = sessions.get(ctx.from!.id);
   if (s?.accountSetup && s.tempCookies) {
     const file = cookieFilePath(s.accountSetup.platform, ctx.from.id, s.accountSetup.nickname);
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    writeEncryptedJson(file, s.tempCookies);
+    await writeEncryptedJson(file, s.tempCookies);
     deleteAccount.run(String(ctx.from.id), s.accountSetup.platform, s.accountSetup.nickname);
     addAccount.run(String(ctx.from.id), s.accountSetup.platform, s.accountSetup.nickname, s.accountSetup.username!, file, dayjs().toISOString());
     await ctx.reply(`✅ Saved cookies for ${s.accountSetup.platform} account "${s.accountSetup.nickname}" (with warnings).`, mainMenu());

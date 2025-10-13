@@ -1,6 +1,6 @@
 import crypto from 'crypto';
-import fs from 'fs';
 import path from 'path';
+import { storageRead, storageSave } from './storage.js';
 
 const SALT = 'humanmode-autoposter';
 const COOKIE_EXTENSION = '.json.enc';
@@ -23,14 +23,15 @@ export function cookieFilePath(platform: string, userId: string | number, nickna
   return path.join('sessions', cookieFilename(platform, userId, nickname));
 }
 
-export function writeEncryptedJson(filePath: string, payload: unknown) {
+export async function writeEncryptedJson(filePath: string, payload: unknown): Promise<void> {
   const data = Buffer.from(JSON.stringify(payload, null, 2));
   const encrypted = encryptBuffer(data);
-  fs.writeFileSync(filePath, encrypted);
+  await storageSave(filePath, encrypted, { contentType: 'application/octet-stream' });
 }
 
-export function readEncryptedJson<T = unknown>(filePath: string): T {
-  const decrypted = decryptBuffer(fs.readFileSync(filePath));
+export async function readEncryptedJson<T = unknown>(filePath: string): Promise<T> {
+  const encrypted = await storageRead(filePath);
+  const decrypted = decryptBuffer(encrypted);
   return JSON.parse(decrypted.toString('utf-8')) as T;
 }
 

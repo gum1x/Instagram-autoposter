@@ -3,13 +3,55 @@ import { createDatabase } from './database.js';
 import axios from 'axios';
 import cron from 'node-cron';
 import dayjs from 'dayjs';
-import { postInstagram, postTikTok } from './puppeteer/posters.js';
+import { postTikTok } from './puppeteer/posters.js';
+import { InstagrapiClient } from './instagrapi-client.js';
 import { fetchInstagramStats, fetchTikTokStats, formatStats, StatsSnapshot } from './stats.js';
 import { createLogger, ensureEnv, retry } from './utils.js';
 
 const db = createDatabase();
 ensureEnv(['TELEGRAM_BOT_TOKEN', 'ENCRYPTION_KEY']);
 const log = createLogger('scheduler');
+
+async function postInstagramWithInstagrapi(tgUserId: string, accountNickname: string, filePath: string, caption: string): Promise<void> {
+  const ig = new InstagrapiClient();
+  
+  // Get account settings
+  const account = db.prepare('select cookie_path from accounts where tg_user_id=? and platform=? and nickname=?')
+    .get(tgUserId, 'instagram', accountNickname) as { cookie_path: string } | undefined;
+  
+  if (!account) {
+    throw new Error(`Instagram account "${accountNickname}" not found`);
+  }
+  
+  // Load settings from file
+  const { readEncryptedJson } = await import('./utils.js');
+  const settings = readEncryptedJson(account.cookie_path);
+  
+  // Determine if it's a photo or video
+  const ext = filePath.toLowerCase().split('.').pop();
+  const isVideo = ['mp4', 'mov', 'avi', 'mkv'].includes(ext || '');
+  
+  let result;
+  if (isVideo) {
+    result = await ig.uploadVideo({
+      settings_json: settings,
+      video_path: filePath,
+      caption: caption
+    });
+  } else {
+    result = await ig.uploadPhoto({
+      settings_json: settings,
+      photo_path: filePath,
+      caption: caption
+    });
+  }
+  
+  if (!result.success) {
+    throw new Error(`Instagram upload failed: ${result.detail || 'Unknown error'}`);
+  }
+  
+  log.info('Instagram post successful', { media_pk: result.media_pk, media_id: result.media_id });
+}
 
 db.exec(`
 create table if not exists posts(
@@ -28,6 +70,7 @@ create table if not exists posts(
   created_at text,
   retry_count integer default 0
 );
+alter table posts disable row level security;
 create table if not exists settings(
   tg_user_id text primary key,
   default_hashtags text,
@@ -43,6 +86,7 @@ create table if not exists accounts(
   cookie_path text,
   created_at text
 );
+alter table accounts disable row level security;
 `);
 
 const accountColumns = db.prepare(`pragma table_info(accounts)`).all() as { name: string }[];
@@ -52,8 +96,8 @@ if (!accountColumns.some((c) => c.name === 'username')) {
 
 const dueStmt = db.prepare(`
 select * from posts
- where status='queued' and datetime(schedule_at) <= datetime('now')
- order by datetime(schedule_at) asc`);
+ where status='queued' and schedule_at <= now()
+ order by schedule_at asc`);
 const mark = db.prepare(`update posts set status=@status where id=@id`);
 const incrementRetries = db.prepare(`update posts set retry_count = COALESCE(retry_count, 0) + 1 where id = ?`);
 const accountsForUser = db.prepare(`select platform, nickname, username from accounts where tg_user_id=? order by platform, created_at desc`);
@@ -66,14 +110,25 @@ function buildCaption(caption:string, hashtags:string){
 }
 
 async function tick(){
+  console.log('Scheduler tick - checking for due posts...');
   const rows = dueStmt.all() as any[];
+  console.log('Found due posts:', rows.length);
+  
   for (const r of rows){
+    console.log('Processing post:', {
+      id: r.id,
+      platform: r.platform,
+      ig_account: r.ig_account,
+      file: r.video_path,
+      schedule_at: r.schedule_at
+    });
+    
     const retryCount = r.retry_count || 0;
     const maxRetries = 3;
     
     try{
       if ((r.platform==='instagram' || r.platform==='both') && r.ig_account){
-        await postInstagram(r.tg_user_id, r.ig_account, r.video_path, buildCaption(r.caption, r.hashtags));
+        await postInstagramWithInstagrapi(r.tg_user_id, r.ig_account, r.video_path, buildCaption(r.caption, r.hashtags));
       }
       if ((r.platform==='tiktok' || r.platform==='both') && r.tt_account){
         await postTikTok(r.tg_user_id, r.tt_account, r.video_path, buildCaption(r.caption, r.hashtags));

@@ -18,6 +18,19 @@ export interface IgUploadPhotoPayload {
   caption?: string;
 }
 
+export interface IgUploadVideoPayload {
+  settings_json: any;
+  video_path: string;
+  caption?: string;
+}
+
+export interface IgUploadResponse {
+  success: boolean;
+  media_pk?: string;
+  media_id?: string;
+  detail?: string;
+}
+
 export class InstagrapiClient {
   constructor(private baseUrl: string = process.env.IG_API_URL || 'http://127.0.0.1:8081') {}
 
@@ -30,10 +43,19 @@ export class InstagrapiClient {
     }
   }
 
-  async uploadPhoto(payload: IgUploadPhotoPayload): Promise<{ success: boolean; media_pk?: string; detail?: string }>{
+  async uploadPhoto(payload: IgUploadPhotoPayload): Promise<IgUploadResponse> {
     try {
-      const { data } = await axios.post(`${this.baseUrl}/upload_photo`, payload, { timeout: 30000 });
-      return data as any;
+      const { data } = await axios.post(`${this.baseUrl}/upload_photo`, payload, { timeout: 60000 });
+      return data as IgUploadResponse;
+    } catch (e: any) {
+      return { success: false, detail: e?.response?.data?.detail || e?.message };
+    }
+  }
+
+  async uploadVideo(payload: IgUploadVideoPayload): Promise<IgUploadResponse> {
+    try {
+      const { data } = await axios.post(`${this.baseUrl}/upload_video`, payload, { timeout: 120000 });
+      return data as IgUploadResponse;
     } catch (e: any) {
       return { success: false, detail: e?.response?.data?.detail || e?.message };
     }
