@@ -94,6 +94,8 @@ type Session = {
     nickname?: string;
     password?: string;
     twoFactorCode?: string;
+    twoFactorToken?: string;
+    loginInProgress?: boolean;
   };
 };
 const sessions = new Map<number, Session>();
@@ -230,8 +232,20 @@ BOT.on('text', async (ctx) => {
       return;
     }
     if (s.accountSetup.stage === 'password') {
+      // If a two-factor flow is already pending, do NOT re-login
+      if (s.accountSetup.twoFactorToken) {
+        s.accountSetup.stage = 'twofa';
+        sessions.set(ctx.from.id, s);
+        await ctx.reply('2FA is already required. Please enter the 6-digit code.');
+        return;
+      }
       s.accountSetup.password = text;
-      s.accountSetup.stage = 'login';
+      sessions.set(ctx.from.id, s);
+      if (s.accountSetup.loginInProgress) {
+        await ctx.reply('Login already in progress...');
+        return;
+      }
+      s.accountSetup.loginInProgress = true;
       sessions.set(ctx.from.id, s);
       await ctx.reply('🔐 Logging in... This may take a moment. Please wait.');
       
@@ -262,8 +276,10 @@ BOT.on('text', async (ctx) => {
           sessions.set(ctx.from.id, s);
         } else if (result.needs2FA) {
           s.accountSetup.stage = 'twofa';
+          s.accountSetup.twoFactorToken = result.token as any;
+          s.accountSetup.loginInProgress = false;
           sessions.set(ctx.from.id, s);
-          await ctx.reply('🔐 **2FA Required**\n\nYour Instagram account has 2FA enabled. Please enter the 6-digit code from your authenticator app:');
+          await ctx.reply('⏳ Waiting for 2FA code... send the 6-digit code now.');
         } else {
           await ctx.reply(`❌ Login failed: ${result.error || 'Unknown error'}\n\nPlease try again with /add_account.`);
           delete s.accountSetup;
@@ -274,30 +290,38 @@ BOT.on('text', async (ctx) => {
         log.error('Login failed during account setup', { error: error instanceof Error ? error.message : String(error), userId: ctx.from.id });
         delete s.accountSetup;
         sessions.set(ctx.from.id, s);
+      } finally {
+        const cur = sessions.get(ctx.from.id);
+        if (cur?.accountSetup) cur.accountSetup.loginInProgress = false;
+        sessions.set(ctx.from.id, cur || s);
       }
       return;
     }
     if (s.accountSetup.stage === 'twofa') {
-      const code = text.trim();
-      if (!/^\d{6}$/.test(code)) {
-        await ctx.reply('❌ Please enter a valid 6-digit 2FA code.');
+      // Ignore any non-6-digit messages while waiting for 2FA
+      if (!/^\d{6}$/.test(text)) {
+        await ctx.reply('⏳ Waiting for 2FA code. Send the 6-digit code.');
         return;
       }
+      const code = text.trim();
+      // By this point it is a valid 6-digit
       
       s.accountSetup.twoFactorCode = code;
-      s.accountSetup.stage = 'login';
       sessions.set(ctx.from.id, s);
-      await ctx.reply('🔐 Completing login with 2FA code...');
-      
-      // Import the login function
-      const { loginToInstagram } = await import('./instagram-login.js');
-      
+      await ctx.reply('🔐 Submitting 2FA code...');
+
+      // Import 2FA submitter
+      const { submitTwoFactor } = await import('./instagram-login.js');
+
       try {
-        const result = await loginToInstagram({
-          username: s.accountSetup.username!,
-          password: s.accountSetup.password!,
-          twoFactorCode: s.accountSetup.twoFactorCode!
-        });
+        const token = s.accountSetup.twoFactorToken as any;
+        if (!token) {
+          await ctx.reply('Session expired. Send /add_account again.');
+          delete s.accountSetup;
+          sessions.set(ctx.from.id, s);
+          return;
+        }
+        const result = await submitTwoFactor(token, s.accountSetup.twoFactorCode!);
         
         if (result.success && result.cookies) {
           // Save the cookies
@@ -312,10 +336,17 @@ BOT.on('text', async (ctx) => {
           await ctx.reply(`✅ Successfully logged in and saved ${s.accountSetup.platform} account "${s.accountSetup.nickname}".`, mainMenu());
           log.info('Account setup completed with 2FA', { platform: s.accountSetup.platform, nickname: s.accountSetup.nickname, userId: ctx.from.id });
         } else {
-          await ctx.reply(`❌ 2FA login failed: ${result.error || 'Unknown error'}\n\nPlease try again with /add_account.`);
+          await ctx.reply(`❌ 2FA failed: ${result.error || 'Unknown error'}. Send a fresh code to try again.`);
+          // Keep stage and token so user can retry without restarting
+          s.accountSetup!.stage = 'twofa';
+          sessions.set(ctx.from.id, s);
+          return;
         }
       } catch (error) {
-        await ctx.reply(`❌ 2FA login failed: ${error instanceof Error ? error.message : String(error)}\n\nPlease try again with /add_account.`);
+        await ctx.reply(`❌ 2FA error: ${error instanceof Error ? error.message : String(error)}. Send a new code to retry.`);
+        s.accountSetup!.stage = 'twofa';
+        sessions.set(ctx.from.id, s);
+        return;
         log.error('2FA login failed during account setup', { error: error instanceof Error ? error.message : String(error), userId: ctx.from.id });
       }
       

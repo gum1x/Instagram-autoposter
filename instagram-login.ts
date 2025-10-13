@@ -4,6 +4,7 @@ import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import { createLogger } from './utils.js';
 import { promises as fs } from 'fs';
 import path from 'path';
+import { v4 as uuidv4 } from 'uuid';
 
 const log = createLogger('instagram-login');
 puppeteer.use(StealthPlugin());
@@ -19,6 +20,7 @@ export interface LoginResult {
   cookies?: any[];
   error?: string;
   needs2FA?: boolean;
+  token?: string;
 }
 
 // Helper: apply cookies to a page (used for session reuse)
@@ -39,6 +41,76 @@ export async function isLoggedIn(page: any): Promise<boolean> {
     return true;
   } catch {
     return false;
+  }
+}
+
+// Keep 2FA-pending sessions in memory to avoid re-login
+type PendingLogin = { browser: any; page: any };
+const pendingLogins = new Map<string, PendingLogin>();
+
+export function cleanupPendingLogin(token: string) {
+  pendingLogins.delete(token);
+}
+
+export async function submitTwoFactor(token: string, twoFactorCode: string): Promise<LoginResult> {
+  const pending = pendingLogins.get(token);
+  if (!pending) return { success: false, error: 'Invalid or expired 2FA token' };
+  const { browser, page } = pending;
+  try {
+    const code = twoFactorCode.replace(/\s+/g, '').trim();
+    const multiOtpSelectors = [
+      'input[data-testid="verification-code-input"] input',
+      'div[role="dialog"] input[type="text"][maxlength="1"]',
+      'input[name^="digit"]',
+      'input[aria-label="digit"]'
+    ];
+    let inputs = [] as any[];
+    for (const sel of multiOtpSelectors) {
+      const nodes = await page.$$(sel);
+      if (nodes && nodes.length >= 4) { inputs = nodes; break; }
+    }
+    if (inputs.length > 0 && code.length >= inputs.length) {
+      for (let i = 0; i < inputs.length && i < code.length; i++) {
+        try { await inputs[i].focus(); } catch {}
+        await inputs[i].type(code[i], { delay: 0 });
+      }
+    } else {
+      const candidates = [
+        'input[name="verificationCode"]',
+        'input[aria-label="Security code"]',
+        'input[name="code"]',
+        'input[autocomplete="one-time-code"]',
+        'input[type="tel"][inputmode="numeric"]',
+        'input[name="otp"]'
+      ];
+      let target: string | null = null;
+      for (const sel of candidates) { if (await page.$(sel)) { target = sel; break; } }
+      if (!target) return { success: false, error: '2FA input not found' };
+      await page.focus(target);
+      await page.type(target, code, { delay: 0 });
+    }
+    try { await page.keyboard.press('Enter'); } catch {}
+    await Promise.race([
+      page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 8000 }).catch(() => {}),
+      page.waitForTimeout(2000)
+    ]);
+
+    // Error check
+    const errorElement = await page.$('[role="alert"], [data-testid="alert"], div[role="dialog"] [role="alert"]');
+    if (errorElement) {
+      const errorText = await page.evaluate((el: any) => el.textContent, errorElement);
+      return { success: false, error: errorText || '2FA submission failed' };
+    }
+
+    // Success: extract cookies
+    const cookies = await page.cookies();
+    await browser.close();
+    cleanupPendingLogin(token);
+    return { success: true, cookies };
+  } catch (e: any) {
+    try { await browser.close(); } catch {}
+    cleanupPendingLogin(token);
+    return { success: false, error: e?.message || String(e) };
   }
 }
 
@@ -143,18 +215,15 @@ export async function loginToInstagram(credentials: LoginCredentials): Promise<L
 
         // Handle cookie/consent banner if present
         try {
-          const consentBtnSelectors = [
-            'button:has-text("Allow essential and optional cookies")',
-            'button:has-text("Only allow essential cookies")',
-            'button:has-text("Accept all")',
+          const consentXPaths = [
+            "//button[contains(., 'Allow essential and optional cookies')]",
+            "//button[contains(., 'Only allow essential cookies')]",
+            "//button[contains(., 'Accept all')]",
+            "//button[contains(., 'Accept')]"
           ];
-          for (const sel of consentBtnSelectors) {
-            const btn = await page.$(sel as any);
-            if (btn) {
-              await btn.click();
-              await page.waitForTimeout(500);
-              break;
-            }
+          for (const xp of consentXPaths) {
+            const [btn] = await page.$x(xp);
+            if (btn) { await (btn as any).click(); await page.waitForTimeout(500); break; }
           }
         } catch {}
       } catch (navError) {
@@ -164,13 +233,51 @@ export async function loginToInstagram(credentials: LoginCredentials): Promise<L
         return;
       }
 
-      // Fill username
+      // Fill username (robust selectors + fallback to open login form)
       log.info('Filling username');
       try {
-        await page.waitForSelector('input[name="username"]', { timeout: 15000 });
-        await page.click('input[name="username"]'); // Click to focus
-        await page.type('input[name="username"]', credentials.username, { delay: 100 });
-        await new Promise(resolve => setTimeout(resolve, 1500));
+        const usernameSelectors = [
+          'input[name="username"]',
+          'input[aria-label="Phone number, username, or email"]',
+          'input[inputmode="email"]',
+          'input[type="text"]'
+        ];
+
+        let usernameSel: string | null = null;
+        for (const sel of usernameSelectors) {
+          if (await page.$(sel)) { usernameSel = sel; break; }
+        }
+
+        if (!usernameSel) {
+          const loginXPaths = [
+            "//a[contains(@href,'/accounts/login')]",
+            "//button[contains(., 'Log in')]",
+            "//a[contains(., 'Log in')]"
+          ];
+          for (const xp of loginXPaths) {
+            const [node] = await page.$x(xp);
+            if (node) { await (node as any).click(); await page.waitForTimeout(800); break; }
+          }
+          for (const sel of usernameSelectors) {
+            if (await page.$(sel)) { usernameSel = sel; break; }
+          }
+        }
+
+        if (!usernameSel) {
+          // Final attempt: navigate directly to login URL
+          await page.goto('https://www.instagram.com/accounts/login/', { waitUntil: 'domcontentloaded', timeout: 20000 });
+          for (const sel of usernameSelectors) {
+            if (await page.$(sel)) { usernameSel = sel; break; }
+          }
+        }
+
+        if (!usernameSel) {
+          throw new Error('Login form not found');
+        }
+
+        await page.click(usernameSel);
+        await page.type(usernameSel, credentials.username, { delay: 60 });
+        await page.waitForTimeout(600);
         log.info('Username filled successfully');
       } catch (error) {
         log.error('Failed to fill username:', error);
@@ -305,34 +412,34 @@ export async function loginToInstagram(credentials: LoginCredentials): Promise<L
 
           // Do not auto-click other actions here; let IG process the code
         } else {
-          log.info('2FA code required but not provided');
-          await browser.close();
-          resolve({ success: false, needs2FA: true, error: '2FA code required' });
-          return;
+          const token = uuidv4();
+          pendingLogins.set(token, { browser, page });
+          resolve({ success: false, needs2FA: true, token, error: '2FA required' });
+          return; // keep session open for submitTwoFactor
         }
       }
 
       // Handle interstitials (Save login info / Turn on notifications)
       try {
         // Save your login info → Not Now / Save Info
-        const saveInfoButtons = [
-          'button:has-text("Not now")',
-          'button:has-text("Not Now")',
-          'div[role="dialog"] button:has-text("Not now")',
+        const saveInfoXPaths = [
+          "//button[contains(., 'Not now')]",
+          "//div[@role='dialog']//button[contains(., 'Not now')]",
+          "//button[contains(., 'Not Now')]"
         ];
-        for (const sel of saveInfoButtons) {
-          const btn = await page.$(sel as any);
-          if (btn) { await btn.click(); await page.waitForTimeout(500); break; }
+        for (const xp of saveInfoXPaths) {
+          const [btn] = await page.$x(xp);
+          if (btn) { await (btn as any).click(); await page.waitForTimeout(500); break; }
         }
 
         // Turn on notifications dialog → Not Now
-        const notifButtons = [
-          'button:has-text("Not now")',
-          'div[role="dialog"] button:has-text("Not Now")'
+        const notifXPaths = [
+          "//button[contains(., 'Not now')]",
+          "//div[@role='dialog']//button[contains(., 'Not Now')]"
         ];
-        for (const sel of notifButtons) {
-          const btn = await page.$(sel as any);
-          if (btn) { await btn.click(); await page.waitForTimeout(500); break; }
+        for (const xp of notifXPaths) {
+          const [btn] = await page.$x(xp);
+          if (btn) { await (btn as any).click(); await page.waitForTimeout(500); break; }
         }
       } catch {}
 
