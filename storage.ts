@@ -27,7 +27,17 @@ function getSupabase(): SupabaseClient {
 }
 
 function normalizeKey(key: string): string {
-  return key.replace(/^\.?\/*/, '').replace(/\\/g, '/');
+  const normalized = key.replace(/\\/g, '/');
+  if (path.isAbsolute(key)) {
+    const cwd = process.cwd().replace(/\\/g, '/');
+    if (normalized.startsWith(cwd)) {
+      const relative = normalized.slice(cwd.length).replace(/^\/+/, '');
+      if (relative) {
+        return relative;
+      }
+    }
+  }
+  return normalized.replace(/^\.?\/*/, '');
 }
 
 function localPathFromKey(key: string): string {

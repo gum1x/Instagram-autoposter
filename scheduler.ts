@@ -6,7 +6,8 @@ import dayjs from 'dayjs';
 import { postTikTok } from './puppeteer/posters.js';
 import { InstagrapiClient } from './instagrapi-client.js';
 import { fetchInstagramStats, fetchTikTokStats, formatStats, StatsSnapshot } from './stats.js';
-import { createLogger, ensureEnv, retry } from './utils.js';
+import { createLogger, ensureEnv, retry, readEncryptedJson } from './utils.js';
+import { storageEnsureLocalPath } from './storage.js';
 
 const db = createDatabase();
 ensureEnv(['TELEGRAM_BOT_TOKEN', 'ENCRYPTION_KEY']);
@@ -24,24 +25,25 @@ async function postInstagramWithInstagrapi(tgUserId: string, accountNickname: st
   }
   
   // Load settings from file
-  const { readEncryptedJson } = await import('./utils.js');
-  const settings = readEncryptedJson(account.cookie_path);
+  const settings = await readEncryptedJson(account.cookie_path);
   
   // Determine if it's a photo or video
   const ext = filePath.toLowerCase().split('.').pop();
   const isVideo = ['mp4', 'mov', 'avi', 'mkv'].includes(ext || '');
   
   let result;
+  const localMediaPath = await storageEnsureLocalPath(filePath);
+
   if (isVideo) {
     result = await ig.uploadVideo({
       settings_json: settings,
-      video_path: filePath,
+      video_path: localMediaPath,
       caption: caption
     });
   } else {
     result = await ig.uploadPhoto({
       settings_json: settings,
-      photo_path: filePath,
+      photo_path: localMediaPath,
       caption: caption
     });
   }
@@ -131,7 +133,8 @@ async function tick(){
         await postInstagramWithInstagrapi(r.tg_user_id, r.ig_account, r.video_path, buildCaption(r.caption, r.hashtags));
       }
       if ((r.platform==='tiktok' || r.platform==='both') && r.tt_account){
-        await postTikTok(r.tg_user_id, r.tt_account, r.video_path, buildCaption(r.caption, r.hashtags));
+        const localMediaPath = await storageEnsureLocalPath(r.video_path);
+        await postTikTok(r.tg_user_id, r.tt_account, localMediaPath, buildCaption(r.caption, r.hashtags));
       }
       if (r.schedule_type === 'everyXh' && r.every_hours){
         const nextAt = dayjs(r.schedule_at).add(r.every_hours, 'hour').toISOString();

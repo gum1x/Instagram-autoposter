@@ -9,6 +9,7 @@ This setup allows you to run your Instagram autoposter bot locally on your compu
    TELEGRAM_BOT_TOKEN=your_bot_token
    SUPABASE_URL=your_supabase_url
    SUPABASE_KEY=your_supabase_key
+   SUPABASE_STORAGE_BUCKET=media
    ENCRYPTION_KEY=your_encryption_key
    ```
 
@@ -57,8 +58,8 @@ npx pm2 monit                     # Open monitor
 Instagram-autoposter/
 ├── dist/                    # Compiled JavaScript files
 ├── logs/                    # PM2 log files
-├── uploads/                 # Uploaded media files
-├── sessions/                # User session data
+├── uploads/                 # Uploaded media files (mirrored to Supabase if configured)
+├── sessions/                # User session data (mirrored to Supabase if configured)
 ├── ecosystem.config.js      # PM2 configuration
 ├── start-backend.sh         # Startup script
 ├── stop-backend.sh          # Stop script

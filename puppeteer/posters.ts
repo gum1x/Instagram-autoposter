@@ -1,7 +1,7 @@
 import puppeteer, { Browser, Page } from 'puppeteer';
-import fs from 'fs';
 import path from 'path';
 import { cookieFilePath, readEncryptedJson, retry, createLogger, writeEncryptedJson } from '../utils.js';
+import { storageEnsureLocalPath, storageTryRead } from '../storage.js';
 
 const log = createLogger('posters');
 const HEADLESS = process.env.HEADLESS === 'false' ? false : true;
@@ -43,9 +43,9 @@ export async function withBrowser<T>(fn: (browser: Browser) => Promise<T>): Prom
 export async function postInstagram(userId: string, nickname: string, videoPath: string, caption: string) {
   return retry(async () => {
     const filePath = cookieFile('instagram', userId, nickname);
-    const cookies = loadCookies(filePath, 'Instagram', nickname);
-    await ensureFileExists(videoPath);
-    log.info('Posting to Instagram', { nickname, video: videoPath });
+    const cookies = await loadCookies(filePath, 'Instagram', nickname);
+    const localVideoPath = await storageEnsureLocalPath(videoPath);
+    log.info('Posting to Instagram', { nickname, video: videoPath, localPath: localVideoPath });
 
     return withBrowser(async (browser) => {
       const page = await browser.newPage();
@@ -97,8 +97,8 @@ export async function postInstagram(userId: string, nickname: string, videoPath:
       if (!fileInput) throw new Error('Instagram file input not found');
       log.info('Step 3: ✅ File input found');
       
-      log.info('Step 4: Uploading file', { filePath: resolvePath(videoPath) });
-      await fileInput.uploadFile(resolvePath(videoPath));
+      log.info('Step 4: Uploading file', { filePath: resolvePath(localVideoPath) });
+      await fileInput.uploadFile(resolvePath(localVideoPath));
       await sleep(3000); // Faster upload wait
       log.info('Step 4: ✅ File uploaded');
 
@@ -208,9 +208,9 @@ export async function postInstagram(userId: string, nickname: string, videoPath:
 export async function postTikTok(userId: string, nickname: string, videoPath: string, caption: string) {
   return retry(async () => {
     const filePath = cookieFile('tiktok', userId, nickname);
-    const cookies = loadCookies(filePath, 'TikTok', nickname);
-    await ensureFileExists(videoPath);
-    log.info('Posting to TikTok', { nickname, video: videoPath });
+    const cookies = await loadCookies(filePath, 'TikTok', nickname);
+    const localVideoPath = await storageEnsureLocalPath(videoPath);
+    log.info('Posting to TikTok', { nickname, video: videoPath, localPath: localVideoPath });
 
     return withBrowser(async (browser) => {
       const page = await browser.newPage();
@@ -222,7 +222,7 @@ export async function postTikTok(userId: string, nickname: string, videoPath: st
 
       const fileInput = await page.$('input[type="file"]');
       if (!fileInput) throw new Error('TikTok file input not found');
-      await fileInput.uploadFile(resolvePath(videoPath));
+      await fileInput.uploadFile(resolvePath(localVideoPath));
       await sleep(5000);
 
       await typeIn(page, [
@@ -351,25 +351,20 @@ async function typeIn(page: Page, selectorCandidates: string[], value: string) {
   throw new Error('Unable to fill input for selectors: ' + selectorCandidates.join(', '));
 }
 
-async function ensureFileExists(filePath: string) {
-  const resolved = resolvePath(filePath);
-  if (!fs.existsSync(resolved)) {
-    throw new Error(`Video file not found: ${resolved}`);
-  }
-}
-
-function loadCookies(filePath: string, platformLabel: string, nickname: string): Cookies {
-  if (!fs.existsSync(filePath)) {
+async function loadCookies(filePath: string, platformLabel: string, nickname: string): Promise<Cookies> {
+  try {
+    return await readEncryptedJson<Cookies>(filePath);
+  } catch (err) {
     const legacyPath = filePath.replace(/\.json\.enc$/, '.json');
-    if (fs.existsSync(legacyPath)) {
-      const legacy = JSON.parse(fs.readFileSync(legacyPath, 'utf-8')) as Cookies;
-      writeEncryptedJson(filePath, legacy);
-      log.warn('Migrated legacy cookie file to encrypted format', { platform: platformLabel, nickname });
-      return legacy;
+    const legacyBuffer = await storageTryRead(legacyPath);
+    if (!legacyBuffer) {
+      throw new Error(`Missing ${platformLabel} cookies for ${nickname}`);
     }
-    throw new Error(`Missing ${platformLabel} cookies for ${nickname}`);
+    const legacy = JSON.parse(legacyBuffer.toString('utf-8')) as Cookies;
+    await writeEncryptedJson(filePath, legacy);
+    log.warn('Migrated legacy cookie file to encrypted format', { platform: platformLabel, nickname });
+    return legacy;
   }
-  return readEncryptedJson<Cookies>(filePath);
 }
 
 function resolvePath(p: string) {

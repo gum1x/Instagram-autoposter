@@ -1,7 +1,7 @@
-import fs from 'fs';
 import dayjs from 'dayjs';
 import { cookieFile, withBrowser } from './puppeteer/posters.js';
 import { readEncryptedJson, writeEncryptedJson } from './utils.js';
+import { storageTryRead } from './storage.js';
 
 export type Platform = 'instagram' | 'tiktok';
 
@@ -18,7 +18,7 @@ export type StatsSnapshot = {
 
 export async function fetchInstagramStats(userId: string, nickname: string, username?: string): Promise<StatsSnapshot> {
   const cookiesPath = cookieFile('instagram', userId, nickname);
-  const cookies = loadCookies(cookiesPath, 'Instagram', nickname);
+  const cookies = await loadCookies(cookiesPath, 'Instagram', nickname);
   const derivedUser = username || cookies.find((c: any) => c.name === 'ds_user')?.value;
   if (!derivedUser) {
     throw new Error(`Missing Instagram username for ${nickname}. Re-add the account and specify the username.`);
@@ -83,7 +83,7 @@ export async function fetchInstagramStats(userId: string, nickname: string, user
 
 export async function fetchTikTokStats(userId: string, nickname: string, username?: string): Promise<StatsSnapshot> {
   const cookiesPath = cookieFile('tiktok', userId, nickname);
-  const cookies = loadCookies(cookiesPath, 'TikTok', nickname);
+  const cookies = await loadCookies(cookiesPath, 'TikTok', nickname);
   const derivedUser = (username || '').replace(/^@/, '').trim();
   if (!derivedUser) {
     throw new Error(`Missing TikTok username for ${nickname}. Re-add the account and specify the username.`);
@@ -163,15 +163,17 @@ export function formatNumber(value: number | null): string {
   return Number(value).toLocaleString();
 }
 
-function loadCookies(filePath: string, platformLabel: string, nickname: string): any[] {
-  if (!fs.existsSync(filePath)) {
+async function loadCookies(filePath: string, platformLabel: string, nickname: string): Promise<any[]> {
+  try {
+    return await readEncryptedJson<any[]>(filePath);
+  } catch (err) {
     const legacyPath = filePath.replace(/\.json\.enc$/, '.json');
-    if (fs.existsSync(legacyPath)) {
-      const legacyCookies = JSON.parse(fs.readFileSync(legacyPath, 'utf-8'));
-      writeEncryptedJson(filePath, legacyCookies);
-      return legacyCookies;
+    const legacyBuffer = await storageTryRead(legacyPath);
+    if (!legacyBuffer) {
+      throw new Error(`Missing ${platformLabel} cookies for ${nickname}`);
     }
-    throw new Error(`Missing ${platformLabel} cookies for ${nickname}`);
+    const legacyCookies = JSON.parse(legacyBuffer.toString('utf-8'));
+    await writeEncryptedJson(filePath, legacyCookies);
+    return legacyCookies;
   }
-  return readEncryptedJson<any[]>(filePath);
 }

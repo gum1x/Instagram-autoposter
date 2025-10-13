@@ -49,10 +49,17 @@ create table if not exists accounts(
 alter table accounts disable row level security;
 `);
 
-const accountColumns = db.prepare(`pragma table_info(accounts)`).all() as { name: string }[];
-if (!accountColumns.some((c) => c.name === 'username')) {
-  db.exec(`alter table accounts add column username text;`);
-}
+// Check if username column exists (async)
+(async () => {
+  try {
+    const accountColumns = await db.prepare(`pragma table_info(accounts)`).all() as { name: string }[];
+    if (!accountColumns.some((c) => c.name === 'username')) {
+      db.exec(`alter table accounts add column username text;`);
+    }
+  } catch (error) {
+    console.error('Error checking account columns:', error);
+  }
+})();
 
 const ensureUserSettings = db.prepare(`
 insert into settings (tg_user_id, default_hashtags, default_every_hours, platform_pref)

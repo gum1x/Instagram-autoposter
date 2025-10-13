@@ -37,6 +37,7 @@ ENCRYPTION_KEY=your_encryption_key
 # For Supabase:
 SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_KEY=your_anon_key
+SUPABASE_STORAGE_BUCKET=media
 
 # For SQLite (local):
 DATABASE_URL=sqlite.db
@@ -51,7 +52,7 @@ For hosting, you need:
 - `dist/` folder (compiled JavaScript)
 - `package.json`
 - `.env` file
-- `uploads/` folder (for media files)
+- `uploads/` folder (for media files) if you are staying on local storage. When `SUPABASE_STORAGE_BUCKET` is configured, media/cookies are mirrored to Supabase object storage automatically.
 
 ## 🚀 **Deploy Commands**
 
