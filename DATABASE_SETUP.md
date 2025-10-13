@@ -1,6 +1,6 @@
 # Database Setup Guide
 
-## 🚀 **Quick Setup for Hosting**
+##  **Quick Setup for Hosting**
 
 ### **Option 1: Supabase (Recommended)**
 

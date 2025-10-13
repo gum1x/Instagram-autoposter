@@ -1,7 +1,10 @@
-import puppeteer from 'puppeteer';
+import puppeteer from 'puppeteer-extra';
+// Stealth to reduce bot detection
+import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import { createLogger } from './utils.js';
 
 const log = createLogger('instagram-login');
+puppeteer.use(StealthPlugin());
 
 export interface LoginCredentials {
   username: string;
@@ -14,6 +17,27 @@ export interface LoginResult {
   cookies?: any[];
   error?: string;
   needs2FA?: boolean;
+}
+
+// Helper: apply cookies to a page (used for session reuse)
+export async function applyCookiesToPage(page: any, cookies: any[]): Promise<void> {
+  if (!cookies || cookies.length === 0) return;
+  try {
+    await page.setCookie(...cookies);
+  } catch (err) {
+    log.error('Failed to apply cookies to page', { err });
+  }
+}
+
+// Helper: check if we appear logged in
+export async function isLoggedIn(page: any): Promise<boolean> {
+  try {
+    // Instagram often redirects to / if logged; presence of the profile/menu button is a signal
+    await page.waitForSelector('a[href*="/accounts/"]', { timeout: 5000 });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export async function loginToInstagram(credentials: LoginCredentials): Promise<LoginResult> {
@@ -75,6 +99,10 @@ export async function loginToInstagram(credentials: LoginCredentials): Promise<L
       }
 
       const page = await browser.newPage();
+      // Realistic UA + languages to reduce friction
+      await page.setUserAgent(
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+      );
       await page.setViewport({ width: 1280, height: 900 });
       await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
 
@@ -110,6 +138,23 @@ export async function loginToInstagram(credentials: LoginCredentials): Promise<L
         }
         
         await new Promise(resolve => setTimeout(resolve, 2000));
+
+        // Handle cookie/consent banner if present
+        try {
+          const consentBtnSelectors = [
+            'button:has-text("Allow essential and optional cookies")',
+            'button:has-text("Only allow essential cookies")',
+            'button:has-text("Accept all")',
+          ];
+          for (const sel of consentBtnSelectors) {
+            const btn = await page.$(sel as any);
+            if (btn) {
+              await btn.click();
+              await page.waitForTimeout(500);
+              break;
+            }
+          }
+        } catch {}
       } catch (navError) {
         log.error('Navigation failed:', navError);
         await browser.close();
@@ -150,12 +195,18 @@ export async function loginToInstagram(credentials: LoginCredentials): Promise<L
       // Click login button
       log.info('Clicking login button');
       try {
-        await page.waitForSelector('button[type="submit"]', { timeout: 10000 });
-        await page.click('button[type="submit"]');
+        // The submit button can be multiple in DOM; ensure we click the visible one
+        await page.waitForSelector('button[type="submit"]', { timeout: 15000 });
+        const submitButtons = await page.$$('button[type="submit"]');
+        if (submitButtons.length > 0) {
+          await submitButtons[0].click();
+        } else {
+          await page.click('button[type="submit"]');
+        }
         log.info('Login button clicked');
         
         // Wait longer for the page to process
-        await new Promise(resolve => setTimeout(resolve, 5000));
+        await new Promise(resolve => setTimeout(resolve, 7000));
         
         // Check for any error messages
         const errorElement = await page.$('[role="alert"]');
@@ -183,23 +234,31 @@ export async function loginToInstagram(credentials: LoginCredentials): Promise<L
         return;
       }
 
-      // Check if we need 2FA
-      const twoFactorSelector = 'input[name="verificationCode"]';
-      const twoFactorExists = await page.$(twoFactorSelector);
+      // Check if we need 2FA (multiple selector variants)
+      const twoFactorSelectors = [
+        'input[name="verificationCode"]',
+        'input[aria-label="Security code"]',
+        'input[name="code"]'
+      ];
+      let twoFactorSelector: string | null = null;
+      for (const sel of twoFactorSelectors) {
+        if (await page.$(sel)) { twoFactorSelector = sel; break; }
+      }
+      const twoFactorExists = !!twoFactorSelector;
       
       if (twoFactorExists) {
         log.info('2FA required');
         
         if (credentials.twoFactorCode) {
           log.info('Using provided 2FA code');
-          await page.type(twoFactorSelector, credentials.twoFactorCode);
+          await page.type(twoFactorSelector!, credentials.twoFactorCode, { delay: 80 });
           await new Promise(resolve => setTimeout(resolve, 1000));
           
           // Click submit for 2FA
           const submitButton = await page.$('button[type="submit"]');
           if (submitButton) {
             await submitButton.click();
-            await new Promise(resolve => setTimeout(resolve, 3000));
+            await new Promise(resolve => setTimeout(resolve, 5000));
           }
         } else {
           log.info('2FA code required but not provided');
@@ -208,6 +267,30 @@ export async function loginToInstagram(credentials: LoginCredentials): Promise<L
           return;
         }
       }
+
+      // Handle interstitials (Save login info / Turn on notifications)
+      try {
+        // Save your login info → Not Now / Save Info
+        const saveInfoButtons = [
+          'button:has-text("Not now")',
+          'button:has-text("Not Now")',
+          'div[role="dialog"] button:has-text("Not now")',
+        ];
+        for (const sel of saveInfoButtons) {
+          const btn = await page.$(sel as any);
+          if (btn) { await btn.click(); await page.waitForTimeout(500); break; }
+        }
+
+        // Turn on notifications dialog → Not Now
+        const notifButtons = [
+          'button:has-text("Not now")',
+          'div[role="dialog"] button:has-text("Not Now")'
+        ];
+        for (const sel of notifButtons) {
+          const btn = await page.$(sel as any);
+          if (btn) { await btn.click(); await page.waitForTimeout(500); break; }
+        }
+      } catch {}
 
       // Check for login errors
       const errorElement = await page.$('[role="alert"]');
@@ -220,7 +303,7 @@ export async function loginToInstagram(credentials: LoginCredentials): Promise<L
       }
 
       // Wait for successful login (check if we're redirected to home page)
-      await new Promise(resolve => setTimeout(resolve, 5000));
+      await new Promise(resolve => setTimeout(resolve, 6000));
       const currentUrl = page.url();
       
       log.info('Current URL after login attempt:', currentUrl);
@@ -258,6 +341,11 @@ export async function loginToInstagram(credentials: LoginCredentials): Promise<L
         resolve({ success: false, error: 'Login failed - still on login page. Please check your credentials.' });
         return;
       }
+
+      // Additional success heuristic: try opening profile menu anchor
+      try {
+        await page.waitForSelector('a[href*="/accounts/"]', { timeout: 5000 });
+      } catch {}
 
       log.info('Login successful, extracting cookies');
       
