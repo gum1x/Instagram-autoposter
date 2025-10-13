@@ -8,6 +8,7 @@
     "bot": "node --env-file=.env dist/bot.js",
     "dev:bot": "tsx bot.ts",
     "dev:scheduler": "tsx scheduler.ts",
+    "py:service": "cd pyservice && uvicorn main:app --host 0.0.0.0 --port 8081",
     "build": "tsc",
     "pm2:start": "pm2 start ecosystem.config.cjs",
     "pm2:stop": "pm2 stop all",

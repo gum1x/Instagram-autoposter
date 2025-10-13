@@ -303,26 +303,7 @@ export async function loginToInstagram(credentials: LoginCredentials): Promise<L
             ]);
           }
 
-          // If still on login/code screen, try a visible Continue/Verify once
-          if (page.url().includes('/accounts/login')) {
-            const retrySelectors = [
-              'button[type="submit"]',
-              'button:has-text("Continue")',
-              'button:has-text("Verify")',
-              'button:has-text("Not now")'
-            ];
-            for (const sel of retrySelectors) {
-              const btn = await page.$(sel as any);
-              if (btn) {
-                await btn.click();
-                await Promise.race([
-                  page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 6000 }).catch(() => {}),
-                  page.waitForTimeout(1500)
-                ]);
-                break;
-              }
-            }
-          }
+          // Do not auto-click other actions here; let IG process the code
         } else {
           log.info('2FA code required but not provided');
           await browser.close();
@@ -371,8 +352,8 @@ export async function loginToInstagram(credentials: LoginCredentials): Promise<L
       
       log.info('Current URL after login attempt:', currentUrl);
       
-      // Check if we're still on login page
-      if (currentUrl.includes('/accounts/login')) {
+      // Check if we're still on login page (allow two_factor as in-progress)
+      if (currentUrl.includes('/accounts/login') && !/two[_-]?factor/i.test(currentUrl)) {
         // Check for specific error messages
         const errorMessages = await page.evaluate(() => {
           const alerts = document.querySelectorAll('[role="alert"], [data-testid="alert"], .x1i10hfl');
