@@ -4,6 +4,7 @@ export interface IgLoginPayload {
   username: string;
   password: string;
   verification_code?: string;
+  proxy_config?: any;
 }
 
 export interface IgLoginResponse {
@@ -16,12 +17,14 @@ export interface IgUploadPhotoPayload {
   settings_json: any;
   photo_path: string;
   caption?: string;
+  proxy_config?: any;
 }
 
 export interface IgUploadVideoPayload {
   settings_json: any;
   video_path: string;
   caption?: string;
+  proxy_config?: any;
 }
 
 export interface IgUploadResponse {

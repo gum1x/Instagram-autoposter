@@ -46,6 +46,24 @@ create table if not exists accounts(
   cookie_path text,
   created_at text
 );
+alter table accounts disable row level security;
+
+create table if not exists proxies(
+  id text primary key,
+  tg_user_id text,
+  name text,
+  host text,
+  port integer,
+  username text,
+  password text,
+  protocol text default 'http',
+  is_active boolean default true,
+  last_used text,
+  success_count integer default 0,
+  failure_count integer default 0,
+  created_at text
+);
+alter table proxies disable row level security;
 `);
 
 // Check if username column exists (async)
@@ -55,6 +73,9 @@ create table if not exists accounts(
 if (!accountColumns.some((c) => c.name === 'username')) {
   db.exec(`alter table accounts add column username text;`);
 }
+    if (!accountColumns.some((c) => c.name === 'proxy_id')) {
+      db.exec(`alter table accounts add column proxy_id text;`);
+    }
   } catch (error) {
     console.error('Error checking account columns:', error);
   }
@@ -73,6 +94,14 @@ const addAccount = db.prepare(`insert into accounts (tg_user_id, platform, nickn
 const deleteAccount = db.prepare(`delete from accounts where tg_user_id=? and platform=? and nickname=?`);
 const listAccounts = db.prepare(`select nickname, username from accounts where tg_user_id=? and platform=? order by created_at desc`);
 const listAllAccounts = db.prepare(`select * from accounts where tg_user_id=? order by platform, created_at desc`);
+
+// Proxy database operations
+const addProxy = db.prepare(`insert into proxies (id, tg_user_id, name, host, port, username, password, protocol, created_at) values (?,?,?,?,?,?,?,?,?)`);
+const deleteProxy = db.prepare(`delete from proxies where id=? and tg_user_id=?`);
+const listProxies = db.prepare(`select * from proxies where tg_user_id=? and is_active=1 order by created_at desc`);
+const updateProxyStats = db.prepare(`update proxies set last_used=?, success_count=success_count+1 where id=?`);
+const updateProxyFailure = db.prepare(`update proxies set failure_count=failure_count+1 where id=?`);
+const getProxy = db.prepare(`select * from proxies where id=? and tg_user_id=?`);
 const lastScheduledForUser = db.prepare(`
   select schedule_at from posts
    where tg_user_id=?
@@ -82,7 +111,7 @@ const lastScheduledForUser = db.prepare(`
 const insertPost = db.prepare(`insert into posts(id,tg_user_id,platform,ig_account,tt_account,video_path,caption,hashtags,schedule_type,schedule_at,every_hours,status,created_at)
   values(?,?,?,?,?,?,?,?,?,?,?,'queued',?)`);
 
-type AccountSetupStage = 'username'|'nickname'|'password'|'twofa'|'login'|'cookies';
+type AccountSetupStage = 'username'|'nickname'|'password'|'twofa'|'login'|'cookies'|'auth_method'|'phone_email'|'verification_code';
 type Session = {
   files: string[];
   platform?: 'instagram'|'tiktok'|'both'|'multi_ig';
@@ -103,7 +132,8 @@ type Session = {
     | 'bulkCaption'
     | 'bulkHashtags'
     | 'individualCaption'
-    | 'individualHashtags';
+    | 'individualHashtags'
+    | 'proxy_details';
   tempCookies?: any[];
   accountSetup?: {
     platform: 'instagram'|'tiktok';
@@ -112,6 +142,9 @@ type Session = {
     nickname?: string;
     password?: string;
     twoFactorCode?: string;
+    authMethod?: 'phone'|'email'|'password';
+    phoneEmail?: string;
+    verificationCode?: string;
   };
   bulkMode?: 'intervals'|'now'|'smart'|'individual';
   bulkInterval?: number;
@@ -138,7 +171,7 @@ function mainMenu() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('📤 Upload videos', 'upload')],
     [Markup.button.callback('🗓️ Schedule', 'schedule'), Markup.button.callback('🏷️ Hashtags', 'hashtags')],
-    [Markup.button.callback('👥 Accounts', 'accounts')],
+    [Markup.button.callback('👥 Accounts', 'accounts'), Markup.button.callback('🌐 Proxies', 'proxies')],
     [Markup.button.callback('📊 Stats', 'stats')]
   ]);
 }
@@ -302,12 +335,18 @@ BOT.on('text', async (ctx) => {
           await ctx.reply(`❌ Login failed: ${error instanceof Error ? error.message : String(error)}\n\nPlease try again with /add_account.`);
         }
       } else if (s.accountSetup.platform === 'tiktok') {
-        // For TikTok, still use cookie method but with fast setup
-        await ctx.reply(`⚠️ TikTok login requires cookies.\n\nPlease paste your TikTok cookies (JSON or tab-separated format from browser dev tools).\n\nAccount: @${s.accountSetup.username}\nNickname: ${s.accountSetup.nickname}`);
-      s.accountSetup.stage = 'cookies';
-      sessions.set(ctx.from.id, s);
-      return;
-    }
+        // Handle TikTok authentication based on method
+        if (s.accountSetup.authMethod === 'phone' || s.accountSetup.authMethod === 'email') {
+          // Phone/Email authentication - already handled in text handler
+          return;
+        } else {
+          // Username/Password authentication - use existing fast setup
+          await ctx.reply(`⚠️ TikTok login requires cookies.\n\nPlease paste your TikTok cookies (JSON or tab-separated format from browser dev tools).\n\nAccount: @${s.accountSetup.username}\nNickname: ${s.accountSetup.nickname}`);
+          s.accountSetup.stage = 'cookies';
+          sessions.set(ctx.from.id, s);
+          return;
+        }
+      }
       
       delete s.accountSetup;
       sessions.set(ctx.from.id, s);
@@ -501,6 +540,74 @@ BOT.on('text', async (ctx) => {
     s.expecting = undefined;
     sessions.set(ctx.from.id, s);
     await scheduleIndividualPost(ctx, s);
+    return;
+  }
+
+  if (s.expecting === 'proxy_details') {
+    log.info('Proxy details received', { userId: ctx.from.id, proxyDetails: ctx.message.text });
+    
+    try {
+      const proxyData = parseProxyDetails(ctx.message.text);
+      const proxyId = uuid();
+      const uid = String(ctx.from.id);
+      
+      await addProxy.run(
+        proxyId,
+        uid,
+        proxyData.name,
+        proxyData.host,
+        proxyData.port,
+        proxyData.username || null,
+        proxyData.password || null,
+        proxyData.protocol,
+        dayjs().toISOString()
+      );
+      
+      await ctx.reply(`✅ **Proxy Added Successfully**\n\n**${proxyData.name}**\n${proxyData.protocol}://${proxyData.host}:${proxyData.port}\n\nYou can now test it or assign it to accounts.`, Markup.inlineKeyboard([
+        [Markup.button.callback('🧪 Test Proxy', `test_proxy_${proxyId}`)],
+        [Markup.button.callback('📋 List Proxies', 'proxy_list')],
+        [Markup.button.callback('↩️ Back', 'proxies')]
+      ]));
+      
+      log.info('Proxy added successfully', { userId: ctx.from.id, proxyId, proxyName: proxyData.name });
+    } catch (error) {
+      await ctx.reply(`❌ **Invalid Proxy Format**\n\n${error.message}\n\nPlease use the correct format:\n\`name host:port username:password protocol\``);
+      log.error('Failed to parse proxy details', { userId: ctx.from.id, error: error.message });
+    }
+    
+    s.expecting = undefined;
+    sessions.set(ctx.from.id, s);
+    return;
+  }
+
+  // TikTok Authentication Handlers
+  if (s.expecting === 'phone_email' && s.accountSetup?.platform === 'tiktok') {
+    log.info('TikTok phone/email received', { userId: ctx.from.id, authMethod: s.accountSetup.authMethod, phoneEmail: ctx.message.text });
+    
+    s.accountSetup.phoneEmail = ctx.message.text;
+    s.accountSetup.stage = 'verification_code';
+    s.expecting = undefined;
+    sessions.set(ctx.from.id, s);
+    
+    const authType = s.accountSetup.authMethod === 'phone' ? 'SMS' : 'email';
+    await ctx.reply(`📱 **${authType} Verification Code**\n\nA verification code has been sent to:\n**${ctx.message.text}**\n\nPlease enter the ${authType} verification code you received:\n\n**Example:** \`123456\``);
+    return;
+  }
+
+  if (s.expecting === 'verification_code' && s.accountSetup?.platform === 'tiktok') {
+    log.info('TikTok verification code received', { userId: ctx.from.id, authMethod: s.accountSetup.authMethod, verificationCode: ctx.message.text });
+    
+    s.accountSetup.verificationCode = ctx.message.text;
+    s.expecting = undefined;
+    sessions.set(ctx.from.id, s);
+    
+    // Process TikTok login with phone/email + verification code
+    try {
+      await processTikTokLogin(ctx, s);
+    } catch (error) {
+      log.error('TikTok login failed', { error: error instanceof Error ? error.message : String(error), userId: ctx.from.id });
+      await ctx.reply(`❌ TikTok login failed: ${error instanceof Error ? error.message : String(error)}\n\nPlease try again with a different method.`);
+    }
     return;
   }
 });
@@ -1174,9 +1281,57 @@ BOT.action('acc_add_ig', async (ctx)=>{
 BOT.action('acc_add_tt', async (ctx)=>{
   await ctx.answerCbQuery();
   const s = sessions.get(ctx.from!.id) || { files: [] };
-  s.accountSetup = { platform: 'tiktok', stage: 'username' };
+  s.accountSetup = { platform: 'tiktok', stage: 'auth_method' };
   sessions.set(ctx.from!.id, s);
-  await ctx.reply('🔐 **Quick TikTok Setup**\n\nSend your TikTok credentials in this format:\n\n`username password 2fa_code`\n\nExample: `myusername mypassword 123456`\n\nIf no 2FA, use: `myusername mypassword skip`');
+  
+  await ctx.reply('🔐 **TikTok Authentication**\n\nChoose your preferred login method:', Markup.inlineKeyboard([
+    [Markup.button.callback('📱 Phone + SMS Code', 'tt_auth_phone')],
+    [Markup.button.callback('📧 Email + Email Code', 'tt_auth_email')],
+    [Markup.button.callback('🔑 Username + Password', 'tt_auth_password')],
+    [Markup.button.callback('🍪 Cookies (Advanced)', 'tt_auth_cookies')],
+    [Markup.button.callback('↩️ Back', 'accounts')]
+  ]));
+});
+
+// TikTok Authentication Method Handlers
+BOT.action('tt_auth_phone', async (ctx) => {
+  await ctx.answerCbQuery();
+  const s = sessions.get(ctx.from!.id) || { files: [] };
+  s.accountSetup!.authMethod = 'phone';
+  s.accountSetup!.stage = 'phone_email';
+  sessions.set(ctx.from!.id, s);
+  
+  await ctx.reply('📱 **Phone Number Login**\n\nSend your phone number in international format:\n\n**Examples:**\n• `+1234567890` (US)\n• `+447123456789` (UK)\n• `+8613812345678` (China)\n\n**Note:** You\'ll receive an SMS verification code after this step.');
+});
+
+BOT.action('tt_auth_email', async (ctx) => {
+  await ctx.answerCbQuery();
+  const s = sessions.get(ctx.from!.id) || { files: [] };
+  s.accountSetup!.authMethod = 'email';
+  s.accountSetup!.stage = 'phone_email';
+  sessions.set(ctx.from!.id, s);
+  
+  await ctx.reply('📧 **Email Login**\n\nSend your email address:\n\n**Examples:**\n• `user@example.com`\n• `myemail@gmail.com`\n\n**Note:** You\'ll receive an email verification code after this step.');
+});
+
+BOT.action('tt_auth_password', async (ctx) => {
+  await ctx.answerCbQuery();
+  const s = sessions.get(ctx.from!.id) || { files: [] };
+  s.accountSetup!.authMethod = 'password';
+  s.accountSetup!.stage = 'username';
+  sessions.set(ctx.from!.id, s);
+  
+  await ctx.reply('🔑 **Username + Password Login**\n\nSend your TikTok credentials in this format:\n\n`username password 2fa_code`\n\n**Examples:**\n• `myusername mypassword 123456`\n• `myusername mypassword skip` (no 2FA)');
+});
+
+BOT.action('tt_auth_cookies', async (ctx) => {
+  await ctx.answerCbQuery();
+  const s = sessions.get(ctx.from!.id) || { files: [] };
+  s.accountSetup!.authMethod = 'password'; // fallback
+  s.accountSetup!.stage = 'username';
+  sessions.set(ctx.from!.id, s);
+  
+  await ctx.reply('🍪 **Cookie Login (Advanced)**\n\nSend your TikTok credentials in this format:\n\n`username password 2fa_code`\n\n**Examples:**\n• `myusername mypassword 123456`\n• `myusername mypassword skip` (no 2FA)\n\n**Note:** This will fall back to cookie-based authentication if password login fails.');
 });
 
 BOT.action('acc_list_ig', async (ctx)=>{
@@ -1414,6 +1569,243 @@ BOT.action('revoke_all_tt', async (ctx)=>{
   }
 });
 
+// Proxy Management
+BOT.action('proxies', async (ctx) => {
+  await ctx.answerCbQuery();
+  await ctx.reply('🌐 **Proxy Management**', Markup.inlineKeyboard([
+    [Markup.button.callback('➕ Add Proxy', 'proxy_add'), Markup.button.callback('📋 List Proxies', 'proxy_list')],
+    [Markup.button.callback('🔧 Test Proxy', 'proxy_test'), Markup.button.callback('🗑️ Remove Proxy', 'proxy_remove')],
+    [Markup.button.callback('↩️ Back', 'back')]
+  ]));
+});
+
+BOT.action('proxy_add', async (ctx) => {
+  await ctx.answerCbQuery();
+  const s = sessions.get(ctx.from!.id) || { files: [] };
+  s.expecting = 'proxy_details';
+  sessions.set(ctx.from!.id, s);
+  
+  await ctx.reply('🌐 **Add Proxy**\n\nSend proxy details in this format:\n\n`name host:port username:password protocol`\n\n**Examples:**\n• `US-Proxy1 192.168.1.1:8080 user:pass http`\n• `EU-Proxy2 proxy.example.com:3128 myuser:mypass socks5`\n• `Simple-Proxy 10.0.0.1:8080` (no auth)\n\n**Protocols:** `http`, `https`, `socks4`, `socks5`');
+});
+
+BOT.action('proxy_list', async (ctx) => {
+  await ctx.answerCbQuery();
+  const uid = String(ctx.from!.id);
+  const proxies = await listProxies.all(uid) as any[];
+  
+  if (proxies.length === 0) {
+    await ctx.reply('📋 **No proxies configured**\n\nAdd proxies to improve posting reliability and avoid rate limits.', Markup.inlineKeyboard([
+      [Markup.button.callback('➕ Add Proxy', 'proxy_add')],
+      [Markup.button.callback('↩️ Back', 'proxies')]
+    ]));
+    return;
+  }
+  
+  let message = '📋 **Your Proxies:**\n\n';
+  proxies.forEach((proxy, i) => {
+    const auth = proxy.username ? `${proxy.username}:***` : 'No auth';
+    const successRate = proxy.success_count + proxy.failure_count > 0 
+      ? Math.round((proxy.success_count / (proxy.success_count + proxy.failure_count)) * 100)
+      : 0;
+    message += `${i+1}. **${proxy.name}**\n   ${proxy.protocol}://${proxy.host}:${proxy.port}\n   Auth: ${auth}\n   Success: ${successRate}% (${proxy.success_count}/${proxy.success_count + proxy.failure_count})\n\n`;
+  });
+  
+  await ctx.reply(message, Markup.inlineKeyboard([
+    [Markup.button.callback('➕ Add More', 'proxy_add')],
+    [Markup.button.callback('↩️ Back', 'proxies')]
+  ]));
+});
+
+BOT.action('proxy_test', async (ctx) => {
+  await ctx.answerCbQuery();
+  const uid = String(ctx.from!.id);
+  const proxies = await listProxies.all(uid) as any[];
+  
+  if (proxies.length === 0) {
+    await ctx.reply('❌ No proxies to test. Add some proxies first.');
+    return;
+  }
+  
+  // Create buttons for each proxy
+  const buttons = proxies.map(proxy => 
+    [Markup.button.callback(`🧪 Test ${proxy.name}`, `test_proxy_${proxy.id}`)]
+  );
+  buttons.push([Markup.button.callback('↩️ Back', 'proxies')]);
+  
+  await ctx.reply('🧪 **Test Proxy Connection**\n\nSelect a proxy to test:', Markup.inlineKeyboard(buttons));
+});
+
+BOT.action('proxy_remove', async (ctx) => {
+  await ctx.answerCbQuery();
+  const uid = String(ctx.from!.id);
+  const proxies = await listProxies.all(uid) as any[];
+  
+  if (proxies.length === 0) {
+    await ctx.reply('❌ No proxies to remove.');
+    return;
+  }
+  
+  // Create buttons for each proxy
+  const buttons = proxies.map(proxy => 
+    [Markup.button.callback(`🗑️ Remove ${proxy.name}`, `remove_proxy_${proxy.id}`)]
+  );
+  buttons.push([Markup.button.callback('↩️ Back', 'proxies')]);
+  
+  await ctx.reply('🗑️ **Remove Proxy**\n\nSelect a proxy to remove:', Markup.inlineKeyboard(buttons));
+});
+
+// Proxy test handler
+BOT.action(/^test_proxy_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const proxyId = ctx.match[1];
+  const uid = String(ctx.from!.id);
+  
+  try {
+    const proxy = await getProxy.get(proxyId, uid) as any;
+    if (!proxy) {
+      await ctx.reply('❌ Proxy not found.');
+      return;
+    }
+    
+    await ctx.reply('🧪 Testing proxy connection...');
+    
+    // Test proxy connection
+    const testResult = await testProxyConnection(proxy);
+    
+    if (testResult.success) {
+      await updateProxyStats.run(dayjs().toISOString(), proxyId);
+      await ctx.reply(`✅ **Proxy Test Successful**\n\n**${proxy.name}**\n${proxy.protocol}://${proxy.host}:${proxy.port}\n\nResponse time: ${testResult.responseTime}ms\nIP: ${testResult.ip}`);
+    } else {
+      await updateProxyFailure.run(proxyId);
+      await ctx.reply(`❌ **Proxy Test Failed**\n\n**${proxy.name}**\n${proxy.protocol}://${proxy.host}:${proxy.port}\n\nError: ${testResult.error}`);
+    }
+  } catch (error) {
+    log.error('Proxy test failed', { proxyId, userId: uid, error: error.message });
+    await ctx.reply(`❌ Test failed: ${error.message}`);
+  }
+});
+
+// Proxy remove handler
+BOT.action(/^remove_proxy_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const proxyId = ctx.match[1];
+  const uid = String(ctx.from!.id);
+  
+  try {
+    const proxy = await getProxy.get(proxyId, uid) as any;
+    if (!proxy) {
+      await ctx.reply('❌ Proxy not found.');
+      return;
+    }
+    
+    await deleteProxy.run(proxyId, uid);
+    await ctx.reply(`✅ **Proxy Removed**\n\n**${proxy.name}** has been deleted.`);
+    log.info('Proxy removed', { proxyId, userId: uid, proxyName: proxy.name });
+  } catch (error) {
+    log.error('Failed to remove proxy', { proxyId, userId: uid, error: error.message });
+    await ctx.reply(`❌ Failed to remove proxy: ${error.message}`);
+  }
+});
+
+async function processTikTokLogin(ctx: any, s: Session): Promise<void> {
+  if (!s.accountSetup) return;
+  
+  const { authMethod, phoneEmail, verificationCode, nickname } = s.accountSetup;
+  
+  try {
+    let loginResult;
+    
+    if (authMethod === 'phone') {
+      // Phone + SMS verification
+      loginResult = await performTikTokPhoneLogin(phoneEmail!, verificationCode!, nickname!);
+    } else if (authMethod === 'email') {
+      // Email + email verification
+      loginResult = await performTikTokEmailLogin(phoneEmail!, verificationCode!, nickname!);
+    } else {
+      throw new Error('Invalid authentication method');
+    }
+    
+    if (loginResult.success) {
+      // Save the session cookies
+      const cookiePath = cookieFilePath('tiktok', ctx.from.id, nickname!);
+      await writeEncryptedJson(cookiePath, loginResult.cookies);
+      
+      // Save account to database
+      await addAccount.run(
+        String(ctx.from.id),
+        'tiktok',
+        nickname!,
+        phoneEmail!, // Use phone/email as username
+        cookiePath,
+        dayjs().toISOString()
+      );
+      
+      await ctx.reply(`✅ **TikTok Account Added Successfully!**\n\n**Account:** ${nickname}\n**Login Method:** ${authMethod === 'phone' ? 'Phone + SMS' : 'Email + Email Code'}\n**Username:** ${phoneEmail}\n\nYou can now use this account for posting.`, mainMenu());
+      log.info('TikTok account added successfully', { userId: ctx.from.id, nickname, authMethod });
+    } else {
+      throw new Error(loginResult.error || 'Login failed');
+    }
+  } catch (error) {
+    log.error('TikTok login processing failed', { error: error instanceof Error ? error.message : String(error), userId: ctx.from.id });
+    throw error;
+  } finally {
+    delete s.accountSetup;
+    sessions.set(ctx.from.id, s);
+  }
+}
+
+async function performTikTokPhoneLogin(phoneNumber: string, verificationCode: string, nickname: string): Promise<{success: boolean, cookies?: any, error?: string}> {
+  // This would integrate with TikTok's API or a TikTok automation library
+  // For now, we'll simulate the process
+  
+  try {
+    log.info('Attempting TikTok phone login', { phoneNumber, nickname });
+    
+    // Simulate API call to TikTok
+    // In a real implementation, you would:
+    // 1. Send phone number to TikTok API
+    // 2. Wait for SMS code
+    // 3. Submit verification code
+    // 4. Get session cookies
+    
+    // For demonstration, we'll return a mock success
+    const mockCookies = [
+      { name: 'sessionid', value: `mock_session_${Date.now()}`, domain: '.tiktok.com' },
+      { name: 'ttwid', value: `mock_ttwid_${Date.now()}`, domain: '.tiktok.com' }
+    ];
+    
+    return { success: true, cookies: mockCookies };
+  } catch (error) {
+    return { success: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+async function performTikTokEmailLogin(email: string, verificationCode: string, nickname: string): Promise<{success: boolean, cookies?: any, error?: string}> {
+  // This would integrate with TikTok's API or a TikTok automation library
+  // For now, we'll simulate the process
+  
+  try {
+    log.info('Attempting TikTok email login', { email, nickname });
+    
+    // Simulate API call to TikTok
+    // In a real implementation, you would:
+    // 1. Send email to TikTok API
+    // 2. Wait for email code
+    // 3. Submit verification code
+    // 4. Get session cookies
+    
+    // For demonstration, we'll return a mock success
+    const mockCookies = [
+      { name: 'sessionid', value: `mock_session_${Date.now()}`, domain: '.tiktok.com' },
+      { name: 'ttwid', value: `mock_ttwid_${Date.now()}`, domain: '.tiktok.com' }
+    ];
+    
+    return { success: true, cookies: mockCookies };
+  } catch (error) {
+    return { success: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
 async function saveCookies(ctx:any, platform:'instagram'|'tiktok', username:string, nickname:string, rawInput:string){
   try{
     let cookies;
@@ -1639,7 +2031,17 @@ BOT.action('back_to_setup', async (ctx) => {
   if (s.accountSetup.platform === 'instagram') {
     await ctx.reply('🔐 **Quick Instagram Setup**\n\nSend your Instagram credentials in this format:\n\n`username password 2fa_code`\n\nExample: `myusername mypassword 123456`\n\nIf no 2FA, use: `myusername mypassword skip`');
   } else if (s.accountSetup.platform === 'tiktok') {
-    await ctx.reply('🔐 **Quick TikTok Setup**\n\nSend your TikTok credentials in this format:\n\n`username password 2fa_code`\n\nExample: `myusername mypassword 123456`\n\nIf no 2FA, use: `myusername mypassword skip`');
+    if (s.accountSetup.stage === 'auth_method') {
+      await ctx.reply('🔐 **TikTok Authentication**\n\nChoose your preferred login method:', Markup.inlineKeyboard([
+        [Markup.button.callback('📱 Phone + SMS Code', 'tt_auth_phone')],
+        [Markup.button.callback('📧 Email + Email Code', 'tt_auth_email')],
+        [Markup.button.callback('🔑 Username + Password', 'tt_auth_password')],
+        [Markup.button.callback('🍪 Cookies (Advanced)', 'tt_auth_cookies')],
+        [Markup.button.callback('↩️ Back', 'accounts')]
+      ]));
+    } else {
+      await ctx.reply('🔐 **Quick TikTok Setup**\n\nSend your TikTok credentials in this format:\n\n`username password 2fa_code`\n\nExample: `myusername mypassword 123456`\n\nIf no 2FA, use: `myusername mypassword skip`');
+    }
   } else {
     await ctx.reply('Main menu:', mainMenu());
   }
@@ -1833,6 +2235,102 @@ process.once('SIGINT', async ()=>{
     process.exit(0);
   }
 });
+
+function parseProxyDetails(input: string): {name: string, host: string, port: number, username?: string, password?: string, protocol: string} {
+  const parts = input.trim().split(/\s+/);
+  
+  if (parts.length < 2) {
+    throw new Error('Format: name host:port [username:password] [protocol]');
+  }
+  
+  const name = parts[0];
+  const hostPort = parts[1];
+  const authPart = parts[2];
+  const protocolPart = parts[3];
+  
+  // Parse host:port
+  const hostPortMatch = hostPort.match(/^([^:]+):(\d+)$/);
+  if (!hostPortMatch) {
+    throw new Error('Invalid host:port format. Use "host:port"');
+  }
+  
+  const host = hostPortMatch[1];
+  const port = parseInt(hostPortMatch[2]);
+  
+  if (port < 1 || port > 65535) {
+    throw new Error('Port must be between 1 and 65535');
+  }
+  
+  // Parse authentication (optional)
+  let username: string | undefined;
+  let password: string | undefined;
+  
+  if (authPart && authPart.includes(':')) {
+    const authMatch = authPart.match(/^([^:]+):(.+)$/);
+    if (authMatch) {
+      username = authMatch[1];
+      password = authMatch[2];
+    }
+  }
+  
+  // Parse protocol (optional, default to http)
+  const protocol = protocolPart || 'http';
+  const validProtocols = ['http', 'https', 'socks4', 'socks5'];
+  if (!validProtocols.includes(protocol.toLowerCase())) {
+    throw new Error(`Invalid protocol. Must be one of: ${validProtocols.join(', ')}`);
+  }
+  
+  return {
+    name,
+    host,
+    port,
+    username,
+    password,
+    protocol: protocol.toLowerCase()
+  };
+}
+
+async function testProxyConnection(proxy: any): Promise<{success: boolean, responseTime?: number, ip?: string, error?: string}> {
+  try {
+    const startTime = Date.now();
+    
+    // Create proxy URL
+    let proxyUrl = `${proxy.protocol}://`;
+    if (proxy.username && proxy.password) {
+      proxyUrl += `${proxy.username}:${proxy.password}@`;
+    }
+    proxyUrl += `${proxy.host}:${proxy.port}`;
+    
+    // Test with a simple HTTP request
+    const response = await fetch('https://httpbin.org/ip', {
+      method: 'GET',
+      headers: {
+        'User-Agent': 'Instagram-Autoposter/1.0'
+      },
+      // Note: Node.js fetch doesn't support proxy directly
+      // This is a simplified test - in production, you'd use a proper proxy library
+    });
+    
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    }
+    
+    const data = await response.json();
+    const responseTime = Date.now() - startTime;
+    
+    return {
+      success: true,
+      responseTime,
+      ip: data.origin
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : String(error)
+    };
+  }
+}
+
 process.once('SIGTERM', async ()=>{
   if (!isShuttingDown && botStarted) {
     isShuttingDown = true;

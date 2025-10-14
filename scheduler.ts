@@ -17,10 +17,15 @@ async function postInstagramWithInstagrapi(tgUserId: string, accountNickname: st
   log.info('Starting Instagram post with instagrapi', { tgUserId, accountNickname, filePath, captionLength: caption.length });
   const ig = new InstagrapiClient();
   
-  // Get account settings
+  // Get account settings and proxy
   log.info('Looking up Instagram account', { tgUserId, accountNickname });
-  const accountStmt = db.prepare('select cookie_path from accounts where tg_user_id=? and platform=? and nickname=?');
-  const account = await accountStmt.get(tgUserId, 'instagram', accountNickname) as { cookie_path: string } | undefined;
+  const accountStmt = db.prepare(`
+    SELECT a.cookie_path, a.proxy_id, p.host, p.port, p.username, p.password, p.protocol 
+    FROM accounts a
+    LEFT JOIN proxies p ON a.proxy_id = p.id
+    WHERE a.tg_user_id=? AND a.platform=? AND a.nickname=?
+  `);
+  const account = await accountStmt.get(tgUserId, 'instagram', accountNickname) as any;
   
   if (!account) {
     log.error('Instagram account not found', { tgUserId, accountNickname });
@@ -31,6 +36,19 @@ async function postInstagramWithInstagrapi(tgUserId: string, accountNickname: st
   log.info('Loading account settings from file', { tgUserId, accountNickname, cookiePath: account.cookie_path });
   const settings = await readEncryptedJson(account.cookie_path);
   log.info('Account settings loaded', { tgUserId, accountNickname, settingsSize: JSON.stringify(settings).length });
+  
+  // Prepare proxy config if available
+  let proxyConfig = null;
+  if (account.proxy_id && account.host && account.port) {
+    proxyConfig = {
+      host: account.host,
+      port: account.port,
+      username: account.username,
+      password: account.password,
+      protocol: account.protocol || 'http'
+    };
+    log.info('Using proxy for Instagram upload', { tgUserId, accountNickname, proxyHost: account.host, proxyPort: account.port });
+  }
   
   // Determine if it's a photo or video
   const ext = filePath.toLowerCase().split('.').pop();
@@ -47,14 +65,16 @@ async function postInstagramWithInstagrapi(tgUserId: string, accountNickname: st
     result = await ig.uploadVideo({
       settings_json: settings,
       video_path: localMediaPath,
-      caption: caption
+      caption: caption,
+      proxy_config: proxyConfig
     });
   } else {
     log.info('Uploading photo to Instagram', { tgUserId, accountNickname, localMediaPath, captionLength: caption.length });
     result = await ig.uploadPhoto({
       settings_json: settings,
       photo_path: localMediaPath,
-      caption: caption
+      caption: caption,
+      proxy_config: proxyConfig
     });
   }
   

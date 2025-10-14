@@ -17,29 +17,66 @@ class LoginRequest(BaseModel):
     username: str
     password: str
     verification_code: Optional[str] = None
+    proxy_config: Optional[dict] = None
 
 
 class UploadPhotoRequest(BaseModel):
     settings_json: dict
     caption: Optional[str] = None
     photo_path: str
+    proxy_config: Optional[dict] = None
 
 
 class UploadVideoRequest(BaseModel):
     settings_json: dict
     caption: Optional[str] = None
     video_path: str
+    proxy_config: Optional[dict] = None
 
 
 class StatsRequest(BaseModel):
     settings_json: dict
     username: str
+    proxy_config: Optional[dict] = None
+
+
+def configure_proxy(client: Client, proxy_config: Optional[dict]):
+    """Configure proxy for instagrapi client"""
+    if not proxy_config:
+        return
+    
+    try:
+        # Extract proxy details
+        host = proxy_config.get('host')
+        port = proxy_config.get('port')
+        username = proxy_config.get('username')
+        password = proxy_config.get('password')
+        protocol = proxy_config.get('protocol', 'http')
+        
+        if not host or not port:
+            return
+        
+        # Build proxy URL
+        proxy_url = f"{protocol}://"
+        if username and password:
+            proxy_url += f"{username}:{password}@"
+        proxy_url += f"{host}:{port}"
+        
+        # Configure proxy for instagrapi
+        client.set_proxy(proxy_url)
+        print(f"Proxy configured: {protocol}://{host}:{port}")
+        
+    except Exception as e:
+        print(f"Failed to configure proxy: {e}")
 
 
 @app.post("/get_stats")
 def get_stats(req: StatsRequest):
     cl = Client()
     try:
+        # Configure proxy if provided
+        configure_proxy(cl, req.proxy_config)
+        
         cl.set_settings(req.settings_json)
         cl.get_timeline_feed()  # warm up session
         
@@ -96,6 +133,9 @@ def get_stats(req: StatsRequest):
 def login(req: LoginRequest):
     cl = Client()
     try:
+        # Configure proxy if provided
+        configure_proxy(cl, req.proxy_config)
+        
         cl.login(req.username, req.password, verification_code=req.verification_code)
         settings = cl.get_settings()
         return {"success": True, "settings": settings}
@@ -107,6 +147,9 @@ def login(req: LoginRequest):
 def upload_photo(req: UploadPhotoRequest):
     cl = Client()
     try:
+        # Configure proxy if provided
+        configure_proxy(cl, req.proxy_config)
+        
         cl.set_settings(req.settings_json)
         cl.get_timeline_feed()  # warm up session
         
@@ -124,6 +167,9 @@ def upload_photo(req: UploadPhotoRequest):
 def upload_video(req: UploadVideoRequest):
     cl = Client()
     try:
+        # Configure proxy if provided
+        configure_proxy(cl, req.proxy_config)
+        
         cl.set_settings(req.settings_json)
         cl.get_timeline_feed()  # warm up session
         
