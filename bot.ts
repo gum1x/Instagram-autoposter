@@ -622,6 +622,7 @@ BOT.action('accounts', async (ctx)=>{
   await ctx.reply('Accounts:', Markup.inlineKeyboard([
     [Markup.button.callback('➕ Add IG', 'acc_add_ig'), Markup.button.callback('➕ Add TT', 'acc_add_tt')],
     [Markup.button.callback('📋 List IG', 'acc_list_ig'), Markup.button.callback('📋 List TT', 'acc_list_tt')],
+    [Markup.button.callback('🔒 Revoke IG', 'acc_revoke_ig'), Markup.button.callback('🔒 Revoke TT', 'acc_revoke_tt')],
     [Markup.button.callback('↩️ Back', 'back')]
   ]));
 });
@@ -650,6 +651,238 @@ BOT.action('acc_list_tt', async (ctx)=>{
   await ctx.answerCbQuery();
   const rows = await listAccounts.all(String(ctx.from!.id), 'tiktok') as any[];
   await ctx.reply(rows.length? ('TT accounts:\n- '+rows.map(r=>r.nickname).join('\n- ')) : 'No TT accounts saved.');
+});
+
+BOT.action('acc_revoke_ig', async (ctx)=>{
+  await ctx.answerCbQuery();
+  const rows = await listAccounts.all(String(ctx.from!.id), 'instagram') as any[];
+  
+  if (rows.length === 0) {
+    await ctx.reply('No Instagram accounts found.');
+    return;
+  }
+  
+  // Create buttons for each account
+  const buttons = rows.map(account => 
+    [Markup.button.callback(`🔒 Revoke ${account.nickname}`, `revoke_ig_${account.nickname}`)]
+  );
+  buttons.push([Markup.button.callback('🔒 Revoke All IG', 'revoke_all_ig')]);
+  buttons.push([Markup.button.callback('↩️ Back', 'accounts')]);
+  
+  await ctx.reply('Select Instagram account to revoke access:', Markup.inlineKeyboard(buttons));
+});
+
+BOT.action('acc_revoke_tt', async (ctx)=>{
+  await ctx.answerCbQuery();
+  const rows = await listAccounts.all(String(ctx.from!.id), 'tiktok') as any[];
+  
+  if (rows.length === 0) {
+    await ctx.reply('No TikTok accounts found.');
+    return;
+  }
+  
+  // Create buttons for each account
+  const buttons = rows.map(account => 
+    [Markup.button.callback(`🔒 Revoke ${account.nickname}`, `revoke_tt_${account.nickname}`)]
+  );
+  buttons.push([Markup.button.callback('🔒 Revoke All TT', 'revoke_all_tt')]);
+  buttons.push([Markup.button.callback('↩️ Back', 'accounts')]);
+  
+  await ctx.reply('Select TikTok account to revoke access:', Markup.inlineKeyboard(buttons));
+});
+
+// Revoke individual account handlers
+BOT.action(/^revoke_ig_(.+)$/, async (ctx)=>{
+  await ctx.answerCbQuery();
+  const accountNickname = ctx.match[1];
+  
+  try {
+    log.info('Revoking Instagram access', { userId: ctx.from!.id, account: accountNickname });
+    
+    // Find and revoke the account
+    const account = await db.prepare(`
+      SELECT * FROM accounts 
+      WHERE tg_user_id = ? AND platform = ? AND nickname = ?
+    `).get(String(ctx.from!.id), 'instagram', accountNickname);
+    
+    if (!account) {
+      await ctx.reply(`❌ Account "${accountNickname}" not found.`);
+      return;
+    }
+    
+    // Delete session file
+    if (account.cookie_path) {
+      try {
+        const fs = await import('fs/promises');
+        await fs.unlink(account.cookie_path);
+        log.info('Deleted session file', { file: account.cookie_path });
+      } catch (error) {
+        log.warn('Could not delete session file', { file: account.cookie_path, error: error.message });
+      }
+    }
+    
+    // Update account status
+    await db.prepare(`
+      UPDATE accounts 
+      SET cookie_path = NULL, 
+          username = NULL
+      WHERE id = ?
+    `).run(account.id);
+    
+    await ctx.reply(`✅ Access revoked for "${accountNickname}".\n\nYou'll need to re-login via Accounts → Add IG to use this account again.`);
+    log.info('Instagram access revoked successfully', { userId: ctx.from!.id, account: accountNickname });
+    
+  } catch (error) {
+    log.error('Failed to revoke Instagram access', { userId: ctx.from!.id, account: accountNickname, error: error.message });
+    await ctx.reply(`❌ Failed to revoke access: ${error.message}`);
+  }
+});
+
+BOT.action(/^revoke_tt_(.+)$/, async (ctx)=>{
+  await ctx.answerCbQuery();
+  const accountNickname = ctx.match[1];
+  
+  try {
+    log.info('Revoking TikTok access', { userId: ctx.from!.id, account: accountNickname });
+    
+    // Find and revoke the account
+    const account = await db.prepare(`
+      SELECT * FROM accounts 
+      WHERE tg_user_id = ? AND platform = ? AND nickname = ?
+    `).get(String(ctx.from!.id), 'tiktok', accountNickname);
+    
+    if (!account) {
+      await ctx.reply(`❌ Account "${accountNickname}" not found.`);
+      return;
+    }
+    
+    // Delete session file
+    if (account.cookie_path) {
+      try {
+        const fs = await import('fs/promises');
+        await fs.unlink(account.cookie_path);
+        log.info('Deleted session file', { file: account.cookie_path });
+      } catch (error) {
+        log.warn('Could not delete session file', { file: account.cookie_path, error: error.message });
+      }
+    }
+    
+    // Update account status
+    await db.prepare(`
+      UPDATE accounts 
+      SET cookie_path = NULL, 
+          username = NULL
+      WHERE id = ?
+    `).run(account.id);
+    
+    await ctx.reply(`✅ Access revoked for "${accountNickname}".\n\nYou'll need to re-login via Accounts → Add TT to use this account again.`);
+    log.info('TikTok access revoked successfully', { userId: ctx.from!.id, account: accountNickname });
+    
+  } catch (error) {
+    log.error('Failed to revoke TikTok access', { userId: ctx.from!.id, account: accountNickname, error: error.message });
+    await ctx.reply(`❌ Failed to revoke access: ${error.message}`);
+  }
+});
+
+// Revoke all accounts handlers
+BOT.action('revoke_all_ig', async (ctx)=>{
+  await ctx.answerCbQuery();
+  
+  try {
+    log.info('Revoking all Instagram access', { userId: ctx.from!.id });
+    
+    const accounts = await db.prepare(`
+      SELECT * FROM accounts 
+      WHERE tg_user_id = ? AND platform = ?
+    `).all(String(ctx.from!.id), 'instagram');
+    
+    if (accounts.length === 0) {
+      await ctx.reply('No Instagram accounts found.');
+      return;
+    }
+    
+    let revokedCount = 0;
+    const fs = await import('fs/promises');
+    
+    for (const account of accounts) {
+      // Delete session file
+      if (account.cookie_path) {
+        try {
+          await fs.unlink(account.cookie_path);
+          log.info('Deleted session file', { file: account.cookie_path });
+        } catch (error) {
+          log.warn('Could not delete session file', { file: account.cookie_path, error: error.message });
+        }
+      }
+      
+      // Update account status
+      await db.prepare(`
+        UPDATE accounts 
+        SET cookie_path = NULL, 
+            username = NULL
+        WHERE id = ?
+      `).run(account.id);
+      
+      revokedCount++;
+    }
+    
+    await ctx.reply(`✅ Revoked access for ${revokedCount} Instagram account(s).\n\nYou'll need to re-login via Accounts → Add IG to use these accounts again.`);
+    log.info('All Instagram access revoked successfully', { userId: ctx.from!.id, count: revokedCount });
+    
+  } catch (error) {
+    log.error('Failed to revoke all Instagram access', { userId: ctx.from!.id, error: error.message });
+    await ctx.reply(`❌ Failed to revoke all access: ${error.message}`);
+  }
+});
+
+BOT.action('revoke_all_tt', async (ctx)=>{
+  await ctx.answerCbQuery();
+  
+  try {
+    log.info('Revoking all TikTok access', { userId: ctx.from!.id });
+    
+    const accounts = await db.prepare(`
+      SELECT * FROM accounts 
+      WHERE tg_user_id = ? AND platform = ?
+    `).all(String(ctx.from!.id), 'tiktok');
+    
+    if (accounts.length === 0) {
+      await ctx.reply('No TikTok accounts found.');
+      return;
+    }
+    
+    let revokedCount = 0;
+    const fs = await import('fs/promises');
+    
+    for (const account of accounts) {
+      // Delete session file
+      if (account.cookie_path) {
+        try {
+          await fs.unlink(account.cookie_path);
+          log.info('Deleted session file', { file: account.cookie_path });
+        } catch (error) {
+          log.warn('Could not delete session file', { file: account.cookie_path, error: error.message });
+        }
+      }
+      
+      // Update account status
+      await db.prepare(`
+        UPDATE accounts 
+        SET cookie_path = NULL, 
+            username = NULL
+        WHERE id = ?
+      `).run(account.id);
+      
+      revokedCount++;
+    }
+    
+    await ctx.reply(`✅ Revoked access for ${revokedCount} TikTok account(s).\n\nYou'll need to re-login via Accounts → Add TT to use these accounts again.`);
+    log.info('All TikTok access revoked successfully', { userId: ctx.from!.id, count: revokedCount });
+    
+  } catch (error) {
+    log.error('Failed to revoke all TikTok access', { userId: ctx.from!.id, error: error.message });
+    await ctx.reply(`❌ Failed to revoke all access: ${error.message}`);
+  }
 });
 
 async function saveCookies(ctx:any, platform:'instagram'|'tiktok', username:string, nickname:string, rawInput:string){
