@@ -124,6 +124,8 @@ const incrementRetries = db.prepare(`update posts set retry_count = COALESCE(ret
 const updateScheduleAt = db.prepare(`update posts set schedule_at=? where id=?`);
 const accountsForUser = db.prepare(`select platform, nickname, username from accounts where tg_user_id=? order by platform, created_at desc`);
 const usersWithAccounts = db.prepare(`select distinct tg_user_id from accounts`);
+const deleteCompletedPosts = db.prepare(`delete from posts where status='completed'`);
+const getCompletedPostsCount = db.prepare(`select count(*) as count from posts where status='completed'`);
 const STATS_DIGEST_CRON = process.env.STATS_DIGEST_CRON || '0 9 * * *';
 
 function buildCaption(caption:string, hashtags:string){
@@ -169,8 +171,11 @@ async function tick(){
         log.info('Re-scheduled recurring job', { postId: r.id, nextAt });
       } else {
         log.info('Marking post as completed', { postId: r.id, platform: r.platform });
-        await mark.run({status:'posted', id:r.id});
-        log.info('Post completed', { postId: r.id, platform: r.platform });
+        await mark.run({status:'completed', id:r.id});
+        log.info('Post marked as completed', { postId: r.id, platform: r.platform });
+        
+        // Clean up completed posts immediately to prevent duplicates
+        await cleanupCompletedPosts();
       }
     }catch(e){
       log.error('Post failed', { postId: r.id, retryCount, error: e instanceof Error ? e.message : String(e), stack: e instanceof Error ? e.stack : undefined });
@@ -192,6 +197,38 @@ async function tick(){
 }
 
 let digestRunning = false;
+let cleanupRunning = false;
+
+async function cleanupCompletedPosts(){
+  if (cleanupRunning) return;
+  cleanupRunning = true;
+  
+  try {
+    log.info('Starting cleanup of completed posts');
+    
+    // Count completed posts before cleanup
+    const beforeCount = await getCompletedPostsCount.get() as { count: number };
+    log.info('Completed posts count before cleanup', { count: beforeCount.count });
+    
+    if (beforeCount.count === 0) {
+      log.info('No completed posts to clean up');
+      return;
+    }
+    
+    // Delete completed posts
+    const result = await deleteCompletedPosts.run();
+    log.info('Cleanup completed', { deletedCount: result.changes });
+    
+    // Verify cleanup
+    const afterCount = await getCompletedPostsCount.get() as { count: number };
+    log.info('Completed posts count after cleanup', { count: afterCount.count });
+    
+  } catch (error) {
+    log.error('Cleanup failed', { error: error instanceof Error ? error.message : String(error) });
+  } finally {
+    cleanupRunning = false;
+  }
+}
 
 async function sendStatsDigest(){
   if (digestRunning) return;
@@ -257,5 +294,12 @@ cron.schedule(STATS_DIGEST_CRON, () => {
     log.error('Stats digest job failed', { error: err instanceof Error ? err.message : String(err) });
   });
 });
+// Clean up completed posts every 5 minutes
+cron.schedule('*/5 * * * *', () => {
+  cleanupCompletedPosts().catch((err)=>{
+    log.error('Cleanup job failed', { error: err instanceof Error ? err.message : String(err) });
+  });
+});
 log.info('Scheduler started. Polling every minute...');
 log.info('Stats digest active', { cron: STATS_DIGEST_CRON });
+log.info('Cleanup job active', { cron: '*/5 * * * *' });

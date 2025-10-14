@@ -95,7 +95,7 @@ type Session = {
   everyHours?: number;
   caption?: string;
   hashtags?: string;
-  expecting?: 'datetime'|'everyHours'|'caption'|'hashtags'|'settingsHashtags';
+  expecting?: 'datetime'|'everyHours'|'caption'|'hashtags'|'settingsHashtags'|'bulkInterval';
   tempCookies?: any[];
   accountSetup?: {
     platform: 'instagram'|'tiktok';
@@ -105,6 +105,9 @@ type Session = {
     password?: string;
     twoFactorCode?: string;
   };
+  bulkMode?: 'intervals'|'now'|'smart'|'individual';
+  bulkInterval?: number;
+  currentFileIndex?: number;
 };
 const sessions = new Map<number, Session>();
 
@@ -313,9 +316,21 @@ BOT.on('text', async (ctx) => {
   }
 
   if (lower === 'done' && s.files?.length && !s.expecting) {
-    await ctx.reply('Choose platforms:', Markup.inlineKeyboard([
-      [Markup.button.callback('Instagram', 'pf_ig'), Markup.button.callback('TikTok', 'pf_tt'), Markup.button.callback('Both', 'pf_both')]
-    ]));
+    const fileCount = s.files.length;
+    log.info('User finished uploading files', { userId: ctx.from.id, fileCount });
+    
+    if (fileCount === 1) {
+      // Single file - use existing flow
+      await ctx.reply('Choose platforms:', Markup.inlineKeyboard([
+        [Markup.button.callback('Instagram', 'pf_ig'), Markup.button.callback('TikTok', 'pf_tt'), Markup.button.callback('Both', 'pf_both')]
+      ]));
+    } else {
+      // Multiple files - offer bulk options
+      await ctx.reply(`📦 **Bulk Upload Detected** (${fileCount} files)\n\nChoose scheduling option:`, Markup.inlineKeyboard([
+        [Markup.button.callback('📅 Schedule All at Intervals', 'bulk_intervals'), Markup.button.callback('⚡ Post All Now', 'bulk_now')],
+        [Markup.button.callback('📋 Smart Spread', 'bulk_smart'), Markup.button.callback('🔄 Individual Setup', 'bulk_individual')]
+      ]));
+    }
     return;
   }
 
@@ -413,11 +428,126 @@ BOT.on('text', async (ctx) => {
     sessions.delete(ctx.from.id);
     return;
   }
+
+  // Bulk upload handlers
+  if (s.expecting === 'bulkInterval') {
+    const n = parseInt(text, 10);
+    if (!Number.isFinite(n) || n <= 0) {
+      await ctx.reply('Please send a positive number of hours (e.g., 2, 4, 6).');
+      return;
+    }
+    s.bulkInterval = n;
+    s.expecting = 'bulkCaption';
+    sessions.set(ctx.from.id, s);
+    
+    const fileCount = s.files.length;
+    const totalHours = (fileCount - 1) * n;
+    const startTime = dayjs().format('HH:mm');
+    const endTime = dayjs().add(totalHours, 'hour').format('HH:mm');
+    
+    await ctx.reply(`📅 **Interval Scheduling** (${fileCount} files)\n\n• Every ${n} hours\n• Starts: ${startTime}\n• Ends: ${endTime}\n\n✍️ Send a caption for all posts (or type "skip"):`);
+    return;
+  }
+
+  if (s.expecting === 'bulkCaption') {
+    log.info('Bulk caption received', { userId: ctx.from.id, captionLength: ctx.message.text.length });
+    s.caption = lower === 'skip' ? '' : ctx.message.text;
+    s.expecting = 'bulkHashtags';
+    sessions.set(ctx.from.id, s);
+    await ctx.reply('Add hashtags (comma-separated) or type "defaults":');
+    return;
+  }
+
+  if (s.expecting === 'bulkHashtags') {
+    log.info('Bulk hashtags received', { userId: ctx.from.id, hashtags: ctx.message.text });
+    if (lower === 'defaults') {
+      const set = await getSettings.get(String(ctx.from.id)) as any;
+      s.hashtags = set?.default_hashtags || '#fyp,#viral';
+    } else {
+      s.hashtags = ctx.message.text;
+    }
+    s.expecting = undefined;
+    sessions.set(ctx.from.id, s);
+    await scheduleBulkPosts(ctx, s);
+    return;
+  }
+
+  if (s.expecting === 'individualCaption') {
+    log.info('Individual caption received', { userId: ctx.from.id, fileIndex: s.currentFileIndex, captionLength: ctx.message.text.length });
+    s.caption = lower === 'skip' ? '' : ctx.message.text;
+    s.expecting = 'individualHashtags';
+    sessions.set(ctx.from.id, s);
+    await ctx.reply('Add hashtags (comma-separated) or type "defaults":');
+    return;
+  }
+
+  if (s.expecting === 'individualHashtags') {
+    log.info('Individual hashtags received', { userId: ctx.from.id, fileIndex: s.currentFileIndex, hashtags: ctx.message.text });
+    if (lower === 'defaults') {
+      const set = await getSettings.get(String(ctx.from.id)) as any;
+      s.hashtags = set?.default_hashtags || '#fyp,#viral';
+    } else {
+      s.hashtags = ctx.message.text;
+    }
+    s.expecting = undefined;
+    sessions.set(ctx.from.id, s);
+    await scheduleIndividualPost(ctx, s);
+    return;
+  }
 });
 
 BOT.action('pf_ig', async (ctx)=>{ await selectPlatform(ctx,'instagram'); });
 BOT.action('pf_tt', async (ctx)=>{ await selectPlatform(ctx,'tiktok'); });
 BOT.action('pf_both', async (ctx)=>{ await selectPlatform(ctx,'both'); });
+
+// Bulk upload handlers
+BOT.action('bulk_intervals', async (ctx)=>{
+  await ctx.answerCbQuery();
+  const s = sessions.get(ctx.from!.id) || { files: [] };
+  s.bulkMode = 'intervals';
+  s.expecting = 'bulkInterval';
+  sessions.set(ctx.from!.id, s);
+  
+  await ctx.reply(`📅 **Interval Scheduling**\n\nHow many hours between each post?\n\nExamples:\n• 2 = Every 2 hours\n• 6 = Every 6 hours\n• 12 = Every 12 hours`);
+});
+
+BOT.action('bulk_now', async (ctx)=>{
+  await ctx.answerCbQuery();
+  const s = sessions.get(ctx.from!.id) || { files: [] };
+  s.bulkMode = 'now';
+  sessions.set(ctx.from!.id, s);
+  
+  await ctx.reply('Choose platforms for bulk posting:', Markup.inlineKeyboard([
+    [Markup.button.callback('Instagram', 'bulk_pf_ig'), Markup.button.callback('TikTok', 'bulk_pf_tt'), Markup.button.callback('Both', 'bulk_pf_both')]
+  ]));
+});
+
+BOT.action('bulk_smart', async (ctx)=>{
+  await ctx.answerCbQuery();
+  const s = sessions.get(ctx.from!.id) || { files: [] };
+  s.bulkMode = 'smart';
+  sessions.set(ctx.from!.id, s);
+  
+  await ctx.reply('Choose platforms for smart spread:', Markup.inlineKeyboard([
+    [Markup.button.callback('Instagram', 'bulk_pf_ig'), Markup.button.callback('TikTok', 'bulk_pf_tt'), Markup.button.callback('Both', 'bulk_pf_both')]
+  ]));
+});
+
+BOT.action('bulk_individual', async (ctx)=>{
+  await ctx.answerCbQuery();
+  const s = sessions.get(ctx.from!.id) || { files: [] };
+  s.bulkMode = 'individual';
+  sessions.set(ctx.from!.id, s);
+  
+  await ctx.reply('🔄 **Individual Setup**\n\nYou\'ll configure each file separately.\n\nChoose platforms:', Markup.inlineKeyboard([
+    [Markup.button.callback('Instagram', 'bulk_pf_ig'), Markup.button.callback('TikTok', 'bulk_pf_tt'), Markup.button.callback('Both', 'bulk_pf_both')]
+  ]));
+});
+
+// Bulk platform handlers
+BOT.action('bulk_pf_ig', async (ctx)=>{ await selectBulkPlatform(ctx,'instagram'); });
+BOT.action('bulk_pf_tt', async (ctx)=>{ await selectBulkPlatform(ctx,'tiktok'); });
+BOT.action('bulk_pf_both', async (ctx)=>{ await selectBulkPlatform(ctx,'both'); });
 
 async function selectPlatform(ctx:any, p:'instagram'|'tiktok'|'both'){
   const s = sessions.get(ctx.from.id) || { files: [] };
@@ -443,6 +573,71 @@ async function selectPlatform(ctx:any, p:'instagram'|'tiktok'|'both'){
       await ctx.reply('Pick TikTok account:', Markup.inlineKeyboard(splitButtons(tts.map(r=>Markup.button.callback(r.nickname, 'ttacc_'+r.nickname)))));
     }
   }
+}
+
+async function selectBulkPlatform(ctx:any, p:'instagram'|'tiktok'|'both'){
+  const s = sessions.get(ctx.from.id) || { files: [] };
+  s.platform = p;
+  sessions.set(ctx.from.id, s);
+  await ctx.answerCbQuery();
+
+  if (p === 'instagram' || p === 'both') {
+    const igs = await listAccounts.all(String(ctx.from.id), 'instagram') as any[];
+    if (!Array.isArray(igs) || igs.length === 0) {
+      await ctx.reply('No Instagram accounts saved. Add one in Accounts → Add IG.');
+      return;
+    }
+  }
+  if (p === 'tiktok' || p === 'both') {
+    const tts = await listAccounts.all(String(ctx.from.id), 'tiktok') as any[];
+    if (!Array.isArray(tts) || tts.length === 0) {
+      await ctx.reply('No TikTok accounts saved. Add one in Accounts → Add TT.');
+      return;
+    }
+  }
+
+  // Handle different bulk modes
+  if (s.bulkMode === 'now') {
+    await handleBulkNow(ctx, s);
+  } else if (s.bulkMode === 'smart') {
+    await handleBulkSmart(ctx, s);
+  } else if (s.bulkMode === 'individual') {
+    await handleBulkIndividual(ctx, s);
+  }
+}
+
+async function handleBulkNow(ctx: any, s: Session) {
+  const fileCount = s.files.length;
+  log.info('Handling bulk now upload', { userId: ctx.from.id, fileCount, platform: s.platform });
+  
+  // For bulk now, we'll schedule all files immediately
+  s.expecting = 'bulkCaption';
+  sessions.set(ctx.from.id, s);
+  
+  await ctx.reply(`⚡ **Bulk Post Now** (${fileCount} files)\n\nAll files will be posted immediately.\n\n✍️ Send a caption for all posts (or type "skip"):`);
+}
+
+async function handleBulkSmart(ctx: any, s: Session) {
+  const fileCount = s.files.length;
+  log.info('Handling bulk smart upload', { userId: ctx.from.id, fileCount, platform: s.platform });
+  
+  // Smart spread: distribute across optimal times (9AM, 1PM, 5PM, 9PM)
+  s.expecting = 'bulkCaption';
+  sessions.set(ctx.from.id, s);
+  
+  await ctx.reply(`🧠 **Smart Spread** (${fileCount} files)\n\nPosts will be distributed across optimal times:\n• 9AM, 1PM, 5PM, 9PM\n\n✍️ Send a caption for all posts (or type "skip"):`);
+}
+
+async function handleBulkIndividual(ctx: any, s: Session) {
+  const fileCount = s.files.length;
+  log.info('Handling bulk individual upload', { userId: ctx.from.id, fileCount, platform: s.platform });
+  
+  // Individual setup: configure each file separately
+  s.currentFileIndex = 0;
+  s.expecting = 'individualCaption';
+  sessions.set(ctx.from.id, s);
+  
+  await ctx.reply(`🔄 **Individual Setup** (${fileCount} files)\n\nFile 1 of ${fileCount}\n\n✍️ Send a caption for this file (or type "skip"):`);
 }
 
 BOT.on('callback_query', async (ctx, next)=>{
@@ -615,6 +810,130 @@ async function persistScheduledPosts(userId:number, s:Session){
   const firstSlot = scheduledTimes[0];
   const formatted = firstSlot ? firstSlot.format('YYYY-MM-DD HH:mm') : 'unknown time';
   return `✅ Queued ${files.length} post(s). First at ${formatted}.`;
+}
+
+async function scheduleBulkPosts(ctx: any, s: Session) {
+  log.info('Scheduling bulk posts', { userId: ctx.from.id, fileCount: s.files.length, bulkMode: s.bulkMode });
+  
+  const uid = String(ctx.from.id);
+  const files = s.files || [];
+  const platform = s.platform || 'both';
+  
+  if (!files.length) {
+    await ctx.reply('⚠️ No files to schedule.', mainMenu());
+    sessions.delete(ctx.from.id);
+    return;
+  }
+
+  const scheduledTimes: dayjs.Dayjs[] = [];
+  const now = dayjs();
+
+  if (s.bulkMode === 'now') {
+    // Schedule all files immediately with small delays
+    for (let i = 0; i < files.length; i++) {
+      scheduledTimes.push(now.add(i * 2, 'minute')); // 2 minutes between posts
+    }
+  } else if (s.bulkMode === 'smart') {
+    // Smart spread across optimal times
+    const optimalTimes = [9, 13, 17, 21]; // 9AM, 1PM, 5PM, 9PM
+    for (let i = 0; i < files.length; i++) {
+      const dayOffset = Math.floor(i / optimalTimes.length);
+      const timeIndex = i % optimalTimes.length;
+      const targetDay = now.add(dayOffset, 'day');
+      const slot = targetDay.hour(optimalTimes[timeIndex]).minute(0).second(0);
+      scheduledTimes.push(slot);
+    }
+  } else if (s.bulkMode === 'intervals' && s.bulkInterval) {
+    // Schedule at specified intervals
+    for (let i = 0; i < files.length; i++) {
+      scheduledTimes.push(now.add(i * s.bulkInterval, 'hour'));
+    }
+  }
+
+  // Insert all posts
+  for (let i = 0; i < files.length; i++) {
+    const slot = scheduledTimes[i];
+    const postId = uuid();
+    
+    try {
+      await insertPost.run(
+        postId,
+        uid,
+        platform,
+        s.igAccount || null,
+        s.ttAccount || null,
+        files[i],
+        s.caption ?? '',
+        s.hashtags ?? '',
+        'at',
+        slot.toISOString(),
+        null,
+        dayjs().toISOString()
+      );
+      log.info('Bulk post inserted', { postId, fileIndex: i, scheduleAt: slot.toISOString() });
+    } catch (error) {
+      log.error('Error inserting bulk post', { postId, fileIndex: i, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+
+  const firstSlot = scheduledTimes[0];
+  const lastSlot = scheduledTimes[scheduledTimes.length - 1];
+  const formatted = firstSlot ? firstSlot.format('YYYY-MM-DD HH:mm') : 'unknown time';
+  const endFormatted = lastSlot ? lastSlot.format('YYYY-MM-DD HH:mm') : 'unknown time';
+  
+  await ctx.reply(`✅ **Bulk Upload Complete**\n\n📦 ${files.length} posts scheduled\n📅 First: ${formatted}\n📅 Last: ${endFormatted}`, mainMenu());
+  sessions.delete(ctx.from.id);
+}
+
+async function scheduleIndividualPost(ctx: any, s: Session) {
+  log.info('Scheduling individual post', { userId: ctx.from.id, fileIndex: s.currentFileIndex, fileCount: s.files.length });
+  
+  const uid = String(ctx.from.id);
+  const files = s.files || [];
+  const platform = s.platform || 'both';
+  const currentIndex = s.currentFileIndex || 0;
+  
+  if (currentIndex >= files.length) {
+    await ctx.reply('✅ All posts scheduled!', mainMenu());
+    sessions.delete(ctx.from.id);
+    return;
+  }
+
+  // Schedule current file
+  const postId = uuid();
+  const scheduleAt = dayjs().add(currentIndex * 2, 'minute'); // 2 minutes between posts
+  
+  try {
+    await insertPost.run(
+      postId,
+      uid,
+      platform,
+      s.igAccount || null,
+      s.ttAccount || null,
+      files[currentIndex],
+      s.caption ?? '',
+      s.hashtags ?? '',
+      'at',
+      scheduleAt.toISOString(),
+      null,
+      dayjs().toISOString()
+    );
+    log.info('Individual post inserted', { postId, fileIndex: currentIndex, scheduleAt: scheduleAt.toISOString() });
+  } catch (error) {
+    log.error('Error inserting individual post', { postId, fileIndex: currentIndex, error: error instanceof Error ? error.message : String(error) });
+  }
+
+  // Move to next file
+  s.currentFileIndex = currentIndex + 1;
+  
+  if (s.currentFileIndex < files.length) {
+    s.expecting = 'individualCaption';
+    sessions.set(ctx.from.id, s);
+    await ctx.reply(`🔄 **Individual Setup** (${files.length} files)\n\nFile ${s.currentFileIndex + 1} of ${files.length}\n\n✍️ Send a caption for this file (or type "skip"):`);
+  } else {
+    await ctx.reply(`✅ **Individual Setup Complete**\n\n📦 ${files.length} posts scheduled\n📅 All posts will be uploaded with 2-minute intervals`, mainMenu());
+    sessions.delete(ctx.from.id);
+  }
 }
 
 BOT.action('accounts', async (ctx)=>{
