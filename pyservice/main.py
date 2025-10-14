@@ -51,8 +51,8 @@ def get_stats(req: StatsRequest):
         medias = cl.user_medias(user_id, amount=30)  # Get last 30 posts
         
         # Calculate engagement metrics
-        from datetime import datetime, timedelta
-        now = datetime.now()
+        from datetime import datetime, timedelta, timezone
+        now = datetime.now(timezone.utc)
         week_ago = now - timedelta(days=7)
         month_ago = now - timedelta(days=30)
         
@@ -66,6 +66,10 @@ def get_stats(req: StatsRequest):
             likes = media.like_count or 0
             comments = media.comment_count or 0
             total_engagement = likes + comments
+            
+            # Ensure taken_at is timezone-aware for comparison
+            if taken_at.tzinfo is None:
+                taken_at = taken_at.replace(tzinfo=timezone.utc)
             
             if taken_at >= week_ago:
                 engagement_7d += total_engagement

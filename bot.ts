@@ -1258,16 +1258,14 @@ BOT.action(/^revoke_ig_(.+)$/, async (ctx)=>{
       }
     }
     
-    // Update account status
+    // Delete the account from database
     await db.prepare(`
-      UPDATE accounts 
-      SET cookie_path = NULL, 
-          username = NULL
+      DELETE FROM accounts 
       WHERE id = ?
     `).run(account.id);
     
-    await ctx.reply(`✅ Access revoked for "${accountNickname}".\n\nYou'll need to re-login via Accounts → Add IG to use this account again.`);
-    log.info('Instagram access revoked successfully', { userId: ctx.from!.id, account: accountNickname });
+    await ctx.reply(`✅ Access revoked and account "${accountNickname}" removed.\n\nYou can add it again via Accounts → Add IG if needed.`);
+    log.info('Instagram account deleted successfully', { userId: ctx.from!.id, account: accountNickname });
     
   } catch (error) {
     log.error('Failed to revoke Instagram access', { userId: ctx.from!.id, account: accountNickname, error: error.message });
@@ -1304,16 +1302,14 @@ BOT.action(/^revoke_tt_(.+)$/, async (ctx)=>{
       }
     }
     
-    // Update account status
+    // Delete the account from database
     await db.prepare(`
-      UPDATE accounts 
-      SET cookie_path = NULL, 
-          username = NULL
+      DELETE FROM accounts 
       WHERE id = ?
     `).run(account.id);
     
-    await ctx.reply(`✅ Access revoked for "${accountNickname}".\n\nYou'll need to re-login via Accounts → Add TT to use this account again.`);
-    log.info('TikTok access revoked successfully', { userId: ctx.from!.id, account: accountNickname });
+    await ctx.reply(`✅ Access revoked and account "${accountNickname}" removed.\n\nYou can add it again via Accounts → Add TT if needed.`);
+    log.info('TikTok account deleted successfully', { userId: ctx.from!.id, account: accountNickname });
     
   } catch (error) {
     log.error('Failed to revoke TikTok access', { userId: ctx.from!.id, account: accountNickname, error: error.message });
@@ -1352,19 +1348,17 @@ BOT.action('revoke_all_ig', async (ctx)=>{
         }
       }
       
-      // Update account status
+      // Delete the account from database
       await db.prepare(`
-        UPDATE accounts 
-        SET cookie_path = NULL, 
-            username = NULL
+        DELETE FROM accounts 
         WHERE id = ?
       `).run(account.id);
       
       revokedCount++;
     }
     
-    await ctx.reply(`✅ Revoked access for ${revokedCount} Instagram account(s).\n\nYou'll need to re-login via Accounts → Add IG to use these accounts again.`);
-    log.info('All Instagram access revoked successfully', { userId: ctx.from!.id, count: revokedCount });
+    await ctx.reply(`✅ Removed ${revokedCount} Instagram account(s).\n\nYou can add them again via Accounts → Add IG if needed.`);
+    log.info('All Instagram accounts deleted successfully', { userId: ctx.from!.id, count: revokedCount });
     
   } catch (error) {
     log.error('Failed to revoke all Instagram access', { userId: ctx.from!.id, error: error.message });
@@ -1402,19 +1396,17 @@ BOT.action('revoke_all_tt', async (ctx)=>{
         }
       }
       
-      // Update account status
+      // Delete the account from database
       await db.prepare(`
-        UPDATE accounts 
-        SET cookie_path = NULL, 
-            username = NULL
+        DELETE FROM accounts 
         WHERE id = ?
       `).run(account.id);
       
       revokedCount++;
     }
     
-    await ctx.reply(`✅ Revoked access for ${revokedCount} TikTok account(s).\n\nYou'll need to re-login via Accounts → Add TT to use these accounts again.`);
-    log.info('All TikTok access revoked successfully', { userId: ctx.from!.id, count: revokedCount });
+    await ctx.reply(`✅ Removed ${revokedCount} TikTok account(s).\n\nYou can add them again via Accounts → Add TT if needed.`);
+    log.info('All TikTok accounts deleted successfully', { userId: ctx.from!.id, count: revokedCount });
     
   } catch (error) {
     log.error('Failed to revoke all TikTok access', { userId: ctx.from!.id, error: error.message });
