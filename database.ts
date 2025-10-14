@@ -306,6 +306,9 @@ export class SupabaseAdapter implements DatabaseAdapter {
         }
         if (normalized.includes('schedule_at <= now()')) {
           query = query.lte('schedule_at', new Date().toISOString());
+        } else if (normalized.includes('schedule_at <= ?')) {
+          const cutoff = params.find((p) => typeof p === 'string' && p.includes('T')) ?? new Date().toISOString();
+          query = query.lte('schedule_at', cutoff);
         }
         if (normalized.includes('order by schedule_at asc')) {
           query = query.order('schedule_at', { ascending: true });

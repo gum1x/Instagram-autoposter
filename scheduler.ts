@@ -91,7 +91,6 @@ create table if not exists posts(
   created_at text,
   retry_count integer default 0
 );
-alter table posts disable row level security;
 create table if not exists settings(
   tg_user_id text primary key,
   default_hashtags text,
@@ -107,7 +106,6 @@ create table if not exists accounts(
   cookie_path text,
   created_at text
 );
-alter table accounts disable row level security;
 `);
 
 const accountColumns = await db.prepare(`pragma table_info(accounts)`).all() as { name: string }[];
@@ -117,7 +115,7 @@ if (!accountColumns.some((c) => c.name === 'username')) {
 
 const dueStmt = db.prepare(`
 select * from posts
- where status='queued' and schedule_at <= now()
+ where status='queued' and schedule_at <= ?
  order by schedule_at asc`);
 const mark = db.prepare(`update posts set status=@status where id=@id`);
 const incrementRetries = db.prepare(`update posts set retry_count = COALESCE(retry_count, 0) + 1 where id = ?`);
@@ -135,7 +133,8 @@ function buildCaption(caption:string, hashtags:string){
 
 async function tick(){
   log.info('Scheduler tick - checking for due posts');
-  const rows = await dueStmt.all() as any[];
+  const nowIso = dayjs().toISOString();
+  const rows = await dueStmt.all(nowIso) as any[];
   log.info('Found due posts', { count: rows.length, posts: rows.map(r => ({ id: r.id, platform: r.platform, schedule_at: r.schedule_at })) });
   
   for (const r of rows){

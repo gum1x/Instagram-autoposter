@@ -31,6 +31,63 @@ class UploadVideoRequest(BaseModel):
     video_path: str
 
 
+class StatsRequest(BaseModel):
+    settings_json: dict
+    username: str
+
+
+@app.post("/get_stats")
+def get_stats(req: StatsRequest):
+    cl = Client()
+    try:
+        cl.set_settings(req.settings_json)
+        cl.get_timeline_feed()  # warm up session
+        
+        # Get user info using instagrapi's API
+        user_info = cl.user_info_by_username(req.username)
+        
+        # Get user's recent media
+        user_id = user_info.pk
+        medias = cl.user_medias(user_id, amount=30)  # Get last 30 posts
+        
+        # Calculate engagement metrics
+        from datetime import datetime, timedelta
+        now = datetime.now()
+        week_ago = now - timedelta(days=7)
+        month_ago = now - timedelta(days=30)
+        
+        engagement_7d = 0
+        engagement_30d = 0
+        posts_7d = 0
+        posts_30d = 0
+        
+        for media in medias:
+            taken_at = media.taken_at
+            likes = media.like_count or 0
+            comments = media.comment_count or 0
+            total_engagement = likes + comments
+            
+            if taken_at >= week_ago:
+                engagement_7d += total_engagement
+                posts_7d += 1
+            
+            if taken_at >= month_ago:
+                engagement_30d += total_engagement
+                posts_30d += 1
+        
+        return {
+            "success": True,
+            "username": user_info.username,
+            "followers": user_info.follower_count,
+            "engagement_7d": engagement_7d,
+            "engagement_30d": engagement_30d,
+            "posts_7d": posts_7d,
+            "posts_30d": posts_30d
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @app.post("/login")
 def login(req: LoginRequest):
     cl = Client()

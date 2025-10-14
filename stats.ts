@@ -18,67 +18,48 @@ export type StatsSnapshot = {
 
 export async function fetchInstagramStats(userId: string, nickname: string, username?: string): Promise<StatsSnapshot> {
   const cookiesPath = cookieFile('instagram', userId, nickname);
-  const cookies = await loadCookies(cookiesPath, 'Instagram', nickname);
-  const derivedUser = username || cookies.find((c: any) => c.name === 'ds_user')?.value;
-  if (!derivedUser) {
+  const settings = await loadCookies(cookiesPath, 'Instagram', nickname);
+  
+  if (!username) {
     throw new Error(`Missing Instagram username for ${nickname}. Re-add the account and specify the username.`);
   }
 
-  return withBrowser(async (browser) => {
-    const page = await browser.newPage();
-    await page.setViewport({ width: 1280, height: 900 });
-    await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
-    await page.setCookie(...cookies);
-    await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2' });
-    await page.goto(`https://www.instagram.com/api/v1/users/web_profile_info/?username=${derivedUser}`, { waitUntil: 'networkidle2' });
+  try {
+    const response = await fetch('http://127.0.0.1:8081/get_stats', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        settings_json: settings,
+        username: username
+      })
+    });
 
-    const raw = await page.evaluate(() => (globalThis.document?.body?.innerText) || '');
-    const payload = JSON.parse(raw);
-    const user = payload?.data?.user;
-    if (!user) {
-      throw new Error(`Unable to load Instagram profile data for ${derivedUser}`);
+    if (!response.ok) {
+      const error = await response.text();
+      throw new Error(`Instagram API error: ${error}`);
     }
 
-    const followers = user.edge_followed_by?.count ?? null;
-    const edges = Array.isArray(user.edge_owner_to_timeline_media?.edges)
-      ? user.edge_owner_to_timeline_media.edges
-      : [];
-
-    const now = dayjs();
-    let engagement7 = 0;
-    let engagement30 = 0;
-    let posts7 = 0;
-    let posts30 = 0;
-
-    for (const edge of edges) {
-      const node = edge?.node;
-      if (!node?.taken_at_timestamp) continue;
-      const takenAt = dayjs.unix(node.taken_at_timestamp);
-      const likes = node.edge_media_preview_like?.count ?? 0;
-      const comments = node.edge_media_to_comment?.count ?? 0;
-      const total = likes + comments;
-
-      if (now.diff(takenAt, 'day', true) <= 30) {
-        engagement30 += total;
-        posts30 += 1;
-      }
-      if (now.diff(takenAt, 'day', true) <= 7) {
-        engagement7 += total;
-        posts7 += 1;
-      }
+    const data = await response.json();
+    
+    if (!data.success) {
+      throw new Error(`Instagram stats fetch failed: ${data.detail || 'Unknown error'}`);
     }
 
     return {
       platform: 'instagram',
       nickname,
-      username: derivedUser,
-      followers,
-      engagement7,
-      engagement30,
-      posts7,
-      posts30
+      username: data.username,
+      followers: data.followers,
+      engagement7: data.engagement_7d,
+      engagement30: data.engagement_30d,
+      posts7: data.posts_7d,
+      posts30: data.posts_30d
     };
-  });
+  } catch (error) {
+    throw new Error(`Failed to fetch Instagram stats for ${nickname}: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 export async function fetchTikTokStats(userId: string, nickname: string, username?: string): Promise<StatsSnapshot> {
@@ -93,7 +74,9 @@ export async function fetchTikTokStats(userId: string, nickname: string, usernam
     const page = await browser.newPage();
     await page.setViewport({ width: 1366, height: 900 });
     await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
-    await page.setCookie(...cookies);
+    if (cookies && cookies.length > 0) {
+      await page.setCookie(...cookies);
+    }
     await page.goto(`https://www.tiktok.com/@${derivedUser}`, { waitUntil: 'networkidle2' });
     await page.waitForFunction(() => {
       const g = globalThis as any;
@@ -163,17 +146,41 @@ export function formatNumber(value: number | null): string {
   return Number(value).toLocaleString();
 }
 
-async function loadCookies(filePath: string, platformLabel: string, nickname: string): Promise<any[]> {
+async function loadCookies(filePath: string, platformLabel: string, nickname: string): Promise<any> {
   try {
-    return await readEncryptedJson<any[]>(filePath);
+    const data = await readEncryptedJson<any>(filePath);
+    if (platformLabel === 'Instagram') {
+      // For Instagram, we expect settings object from instagrapi
+      if (typeof data !== 'object' || data === null) {
+        throw new Error(`Invalid settings format for ${nickname}`);
+      }
+      return data;
+    } else {
+      // For TikTok, we still expect cookies array
+      if (!Array.isArray(data)) {
+        throw new Error(`Invalid cookie format for ${nickname}`);
+      }
+      return data;
+    }
   } catch (err) {
     const legacyPath = filePath.replace(/\.json\.enc$/, '.json');
     const legacyBuffer = await storageTryRead(legacyPath);
     if (!legacyBuffer) {
       throw new Error(`Missing ${platformLabel} cookies for ${nickname}`);
     }
-    const legacyCookies = JSON.parse(legacyBuffer.toString('utf-8'));
-    await writeEncryptedJson(filePath, legacyCookies);
-    return legacyCookies;
+    const legacyData = JSON.parse(legacyBuffer.toString('utf-8'));
+    
+    if (platformLabel === 'Instagram') {
+      if (typeof legacyData !== 'object' || legacyData === null) {
+        throw new Error(`Invalid legacy settings format for ${nickname}`);
+      }
+    } else {
+      if (!Array.isArray(legacyData)) {
+        throw new Error(`Invalid legacy cookie format for ${nickname}`);
+      }
+    }
+    
+    await writeEncryptedJson(filePath, legacyData);
+    return legacyData;
   }
 }

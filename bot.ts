@@ -31,7 +31,6 @@ create table if not exists posts(
   created_at text,
   retry_count integer default 0
 );
-alter table posts disable row level security;
 create table if not exists settings(
   tg_user_id text primary key,
   default_hashtags text,
@@ -39,7 +38,7 @@ create table if not exists settings(
   platform_pref text
 );
 create table if not exists accounts(
-  id serial primary key,
+  id integer primary key autoincrement,
   tg_user_id text,
   platform text,
   nickname text,
@@ -47,16 +46,15 @@ create table if not exists accounts(
   cookie_path text,
   created_at text
 );
-alter table accounts disable row level security;
 `);
 
 // Check if username column exists (async)
 (async () => {
   try {
     const accountColumns = await db.prepare(`pragma table_info(accounts)`).all() as { name: string }[];
-    if (!accountColumns.some((c) => c.name === 'username')) {
-      db.exec(`alter table accounts add column username text;`);
-    }
+if (!accountColumns.some((c) => c.name === 'username')) {
+  db.exec(`alter table accounts add column username text;`);
+}
   } catch (error) {
     console.error('Error checking account columns:', error);
   }
@@ -87,15 +85,25 @@ const insertPost = db.prepare(`insert into posts(id,tg_user_id,platform,ig_accou
 type AccountSetupStage = 'username'|'nickname'|'password'|'twofa'|'login'|'cookies';
 type Session = {
   files: string[];
-  platform?: 'instagram'|'tiktok'|'both';
+  platform?: 'instagram'|'tiktok'|'both'|'multi_ig';
   igAccount?: string;
   ttAccount?: string;
+  multiAccounts?: string[];
   when?: 'now'|'after2h'|'tomorrow'|'at'|'everyXh'|'smart';
   atISO?: string;
   everyHours?: number;
   caption?: string;
   hashtags?: string;
-  expecting?: 'datetime'|'everyHours'|'caption'|'hashtags'|'settingsHashtags'|'bulkInterval';
+  expecting?: 'datetime'
+    | 'everyHours'
+    | 'caption'
+    | 'hashtags'
+    | 'settingsHashtags'
+    | 'bulkInterval'
+    | 'bulkCaption'
+    | 'bulkHashtags'
+    | 'individualCaption'
+    | 'individualHashtags';
   tempCookies?: any[];
   accountSetup?: {
     platform: 'instagram'|'tiktok';
@@ -146,18 +154,18 @@ BOT.action('upload', async (ctx) => {
 BOT.on('video', async (ctx) => {
   log.info('User sent video', { userId: ctx.from.id, fileId: ctx.message.video.file_id, fileSize: ctx.message.video.file_size });
   try {
-    const s = sessions.get(ctx.from.id) || { files: [] };
+  const s = sessions.get(ctx.from.id) || { files: [] };
     log.info('Getting video file from Telegram', { userId: ctx.from.id, fileId: ctx.message.video.file_id });
-    const file = await ctx.telegram.getFile(ctx.message.video.file_id);
-    const url = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
-    const dest = path.join('uploads', `${ctx.message.video.file_id}.mp4`);
+  const file = await ctx.telegram.getFile(ctx.message.video.file_id);
+  const url = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
+  const dest = path.join('uploads', `${ctx.message.video.file_id}.mp4`);
     log.info('Downloading video from Telegram', { userId: ctx.from.id, url, dest });
-    const res = await fetch(url);
-    const buf = Buffer.from(await res.arrayBuffer());
+  const res = await fetch(url);
+  const buf = Buffer.from(await res.arrayBuffer());
     log.info('Saving video to storage', { userId: ctx.from.id, dest, size: buf.length });
     await storageSave(dest, buf, { contentType: 'video/mp4' });
-    s.files.push(dest);
-    sessions.set(ctx.from.id, s);
+  s.files.push(dest);
+  sessions.set(ctx.from.id, s);
     log.info('Video saved successfully', { userId: ctx.from.id, fileCount: s.files.length, dest });
     await ctx.reply(`✅ Success saved video (${s.files.length}). Send more or type "done".`);
   } catch (error) {
@@ -296,10 +304,10 @@ BOT.on('text', async (ctx) => {
       } else if (s.accountSetup.platform === 'tiktok') {
         // For TikTok, still use cookie method but with fast setup
         await ctx.reply(`⚠️ TikTok login requires cookies.\n\nPlease paste your TikTok cookies (JSON or tab-separated format from browser dev tools).\n\nAccount: @${s.accountSetup.username}\nNickname: ${s.accountSetup.nickname}`);
-        s.accountSetup.stage = 'cookies';
-        sessions.set(ctx.from.id, s);
-        return;
-      }
+      s.accountSetup.stage = 'cookies';
+      sessions.set(ctx.from.id, s);
+      return;
+    }
       
       delete s.accountSetup;
       sessions.set(ctx.from.id, s);
@@ -321,8 +329,9 @@ BOT.on('text', async (ctx) => {
     
     if (fileCount === 1) {
       // Single file - use existing flow
-      await ctx.reply('Choose platforms:', Markup.inlineKeyboard([
-        [Markup.button.callback('Instagram', 'pf_ig'), Markup.button.callback('TikTok', 'pf_tt'), Markup.button.callback('Both', 'pf_both')]
+    await ctx.reply('Choose platforms:', Markup.inlineKeyboard([
+        [Markup.button.callback('Instagram', 'pf_ig'), Markup.button.callback('TikTok', 'pf_tt'), Markup.button.callback('Both', 'pf_both')],
+        [Markup.button.callback('🎯 Multi-Account', 'pf_multi')]
       ]));
     } else {
       // Multiple files - offer bulk options
@@ -499,6 +508,7 @@ BOT.on('text', async (ctx) => {
 BOT.action('pf_ig', async (ctx)=>{ await selectPlatform(ctx,'instagram'); });
 BOT.action('pf_tt', async (ctx)=>{ await selectPlatform(ctx,'tiktok'); });
 BOT.action('pf_both', async (ctx)=>{ await selectPlatform(ctx,'both'); });
+BOT.action('pf_multi', async (ctx)=>{ await selectMultiAccount(ctx); });
 
 // Bulk upload handlers
 BOT.action('bulk_intervals', async (ctx)=>{
@@ -549,6 +559,111 @@ BOT.action('bulk_pf_ig', async (ctx)=>{ await selectBulkPlatform(ctx,'instagram'
 BOT.action('bulk_pf_tt', async (ctx)=>{ await selectBulkPlatform(ctx,'tiktok'); });
 BOT.action('bulk_pf_both', async (ctx)=>{ await selectBulkPlatform(ctx,'both'); });
 
+async function selectMultiAccount(ctx: any) {
+  await ctx.answerCbQuery();
+  const uid = String(ctx.from.id);
+  
+  // Get all Instagram accounts for this user
+  const igAccounts = await listAccounts.all(uid, 'instagram') as any[];
+  
+  if (igAccounts.length < 2) {
+    await ctx.reply('❌ **Multi-Account Posting**\n\nYou need at least 2 Instagram accounts to use this feature.\n\nAdd more accounts in: Accounts → Add IG', Markup.inlineKeyboard([
+      [Markup.button.callback('📤 Upload Videos', 'upload')],
+      [Markup.button.callback('👥 Accounts', 'accounts')],
+      [Markup.button.callback('↩️ Back', 'back')]
+    ]));
+    return;
+  }
+  
+  const s = sessions.get(ctx.from.id) || { files: [] };
+  s.platform = 'multi_ig';
+  s.multiAccounts = [];
+  sessions.set(ctx.from.id, s);
+  
+  // Create account selection buttons
+  const buttons = [];
+  for (let i = 0; i < igAccounts.length; i += 2) {
+    const row = [];
+    row.push(Markup.button.callback(`☐ ${igAccounts[i].nickname}`, `multi_acc_${igAccounts[i].nickname}`));
+    if (i + 1 < igAccounts.length) {
+      row.push(Markup.button.callback(`☐ ${igAccounts[i + 1].nickname}`, `multi_acc_${igAccounts[i + 1].nickname}`));
+    }
+    buttons.push(row);
+  }
+  
+  buttons.push([Markup.button.callback('✅ Continue', 'multi_continue')]);
+  buttons.push([Markup.button.callback('↩️ Back', 'upload')]);
+  
+  await ctx.reply(`🎯 **Multi-Account Posting**\n\nSelect Instagram accounts to post to:\n\n📋 Available accounts: ${igAccounts.length}\n☐ Selected: 0`, Markup.inlineKeyboard(buttons));
+}
+
+// Multi-account selection handlers
+BOT.action(/^multi_acc_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const nickname = ctx.match[1];
+  const s = sessions.get(ctx.from.id) || { files: [] };
+  
+  if (!s.multiAccounts) s.multiAccounts = [];
+  
+  const index = s.multiAccounts.indexOf(nickname);
+  if (index > -1) {
+    // Remove account
+    s.multiAccounts.splice(index, 1);
+  } else {
+    // Add account
+    s.multiAccounts.push(nickname);
+  }
+  
+  sessions.set(ctx.from.id, s);
+  
+  // Update button text
+  const isSelected = s.multiAccounts.includes(nickname);
+  const buttonText = `${isSelected ? '☑️' : '☐'} ${nickname}`;
+  
+  // Update the message with new selection count
+  const uid = String(ctx.from.id);
+  const igAccounts = await listAccounts.all(uid, 'instagram') as any[];
+  
+  const buttons = [];
+  for (let i = 0; i < igAccounts.length; i += 2) {
+    const row = [];
+    const isSelected1 = s.multiAccounts.includes(igAccounts[i].nickname);
+    row.push(Markup.button.callback(`${isSelected1 ? '☑️' : '☐'} ${igAccounts[i].nickname}`, `multi_acc_${igAccounts[i].nickname}`));
+    if (i + 1 < igAccounts.length) {
+      const isSelected2 = s.multiAccounts.includes(igAccounts[i + 1].nickname);
+      row.push(Markup.button.callback(`${isSelected2 ? '☑️' : '☐'} ${igAccounts[i + 1].nickname}`, `multi_acc_${igAccounts[i + 1].nickname}`));
+    }
+    buttons.push(row);
+  }
+  
+  buttons.push([Markup.button.callback('✅ Continue', 'multi_continue')]);
+  buttons.push([Markup.button.callback('↩️ Back', 'upload')]);
+  
+  await ctx.editMessageText(`🎯 **Multi-Account Posting**\n\nSelect Instagram accounts to post to:\n\n📋 Available accounts: ${igAccounts.length}\n☑️ Selected: ${s.multiAccounts.length}`, Markup.inlineKeyboard(buttons));
+});
+
+BOT.action('multi_continue', async (ctx) => {
+  await ctx.answerCbQuery();
+  const s = sessions.get(ctx.from.id) || { files: [] };
+  
+  if (!s.multiAccounts || s.multiAccounts.length === 0) {
+    await ctx.reply('❌ Please select at least one account to continue.');
+    return;
+  }
+  
+  if (s.multiAccounts.length > 5) {
+    await ctx.reply('❌ Maximum 5 accounts allowed for multi-posting to avoid rate limits.');
+    return;
+  }
+  
+  // Continue with scheduling flow
+  await ctx.reply(`✅ **Selected ${s.multiAccounts.length} accounts:**\n\n${s.multiAccounts.map(acc => `• ${acc}`).join('\n')}\n\nWhen do you want to post?`, Markup.inlineKeyboard([
+    [Markup.button.callback('⚡ Now', 'when_now'), Markup.button.callback('⏰ In 2h', 'when_after2h')],
+    [Markup.button.callback('📅 Tomorrow', 'when_tomorrow'), Markup.button.callback('🕐 Custom Time', 'when_at')],
+    [Markup.button.callback('↩️ Back', 'upload')]
+  ]));
+});
+
 async function selectPlatform(ctx:any, p:'instagram'|'tiktok'|'both'){
   const s = sessions.get(ctx.from.id) || { files: [] };
   s.platform = p;
@@ -564,6 +679,7 @@ async function selectPlatform(ctx:any, p:'instagram'|'tiktok'|'both'){
       await ctx.reply('Pick Instagram account:', Markup.inlineKeyboard(splitButtons(igs.map(r=>Markup.button.callback(r.nickname, 'igacc_'+r.nickname)))));
     }
   }
+  
   if (p === 'tiktok' || p === 'both') {
     const tts = await listAccounts.all(String(ctx.from.id), 'tiktok') as any[];
     console.log('TikTok accounts query result:', tts);
@@ -763,11 +879,11 @@ async function persistScheduledPosts(userId:number, s:Session){
       scheduledTimes.push(slot);
     }
   } else {
-    for (let i = 0; i < files.length; i++) {
-      const slot = (when === 'everyXh')
-        ? firstAt.add(i * (everyH ?? defaultEvery), 'hour')
-        : firstAt.add(i * 3, 'minute');
-      scheduledTimes.push(slot);
+  for (let i = 0; i < files.length; i++) {
+    const slot = (when === 'everyXh')
+      ? firstAt.add(i * (everyH ?? defaultEvery), 'hour')
+      : firstAt.add(i * 3, 'minute');
+    scheduledTimes.push(slot);
     }
   }
 
@@ -786,30 +902,81 @@ async function persistScheduledPosts(userId:number, s:Session){
     });
     
     try {
-      const result = await insertPost.run(
-        postId,
-        uid,
-        platform,
-        s.igAccount || null,
-        s.ttAccount || null,
-        files[i],
-        s.caption ?? '',
-        s.hashtags ?? '',
-        when === 'everyXh' ? 'everyXh' : 'at',
-        slot.toISOString(),
-        everyH ?? null,
-        dayjs().toISOString()
-      );
-      console.log('Post insert result:', result);
-      console.log('Post inserted successfully:', postId);
+      if (platform === 'multi_ig' && s.multiAccounts && s.multiAccounts.length > 0) {
+        // Multi-account posting: create one post per account
+        for (const accountNickname of s.multiAccounts) {
+          const multiPostId = uuid();
+          const result = await insertPost.run(
+            multiPostId,
+            uid,
+            'instagram',
+            accountNickname,
+            null,
+            files[i],
+            s.caption ?? '',
+            s.hashtags ?? '',
+            when === 'everyXh' ? 'everyXh' : 'at',
+            slot.toISOString(),
+            everyH ?? null,
+            dayjs().toISOString()
+          );
+          
+          log.info('Multi-account post scheduled', { 
+            postId: multiPostId, 
+            userId: uid, 
+            platform: 'instagram',
+            account: accountNickname,
+            file: files[i], 
+            scheduleAt: slot.toISOString(),
+            insertResult: result 
+          });
+        }
+      } else {
+        // Single account posting
+        const result = await insertPost.run(
+          postId,
+      uid,
+      platform,
+      s.igAccount || null,
+      s.ttAccount || null,
+      files[i],
+      s.caption ?? '',
+      s.hashtags ?? '',
+      when === 'everyXh' ? 'everyXh' : 'at',
+      slot.toISOString(),
+      everyH ?? null,
+      dayjs().toISOString()
+    );
+        
+        log.info('Post scheduled successfully', { 
+          postId, 
+          userId: uid, 
+          platform, 
+          file: files[i], 
+          scheduleAt: slot.toISOString(),
+          insertResult: result 
+        });
+      }
     } catch (error) {
-      console.error('Error inserting post:', error);
+      log.error('Failed to schedule post', { 
+        postId, 
+        userId: uid, 
+        platform, 
+        file: files[i], 
+        error: error instanceof Error ? error.message : String(error) 
+      });
     }
   }
 
   const firstSlot = scheduledTimes[0];
   const formatted = firstSlot ? firstSlot.format('YYYY-MM-DD HH:mm') : 'unknown time';
+  
+  if (platform === 'multi_ig' && s.multiAccounts && s.multiAccounts.length > 0) {
+    const totalPosts = files.length * s.multiAccounts.length;
+    return `✅ Queued ${totalPosts} posts across ${s.multiAccounts.length} accounts. First at ${formatted}.`;
+  } else {
   return `✅ Queued ${files.length} post(s). First at ${formatted}.`;
+  }
 }
 
 async function scheduleBulkPosts(ctx: any, s: Session) {
@@ -856,21 +1023,44 @@ async function scheduleBulkPosts(ctx: any, s: Session) {
     const postId = uuid();
     
     try {
-      await insertPost.run(
-        postId,
-        uid,
-        platform,
-        s.igAccount || null,
-        s.ttAccount || null,
-        files[i],
-        s.caption ?? '',
-        s.hashtags ?? '',
-        'at',
-        slot.toISOString(),
-        null,
-        dayjs().toISOString()
-      );
-      log.info('Bulk post inserted', { postId, fileIndex: i, scheduleAt: slot.toISOString() });
+      if (platform === 'multi_ig' && s.multiAccounts && s.multiAccounts.length > 0) {
+        // Multi-account posting: create one post per account
+        for (const accountNickname of s.multiAccounts) {
+          const multiPostId = uuid();
+          await insertPost.run(
+            multiPostId,
+            uid,
+            'instagram',
+            accountNickname,
+            null,
+            files[i],
+            s.caption ?? '',
+            s.hashtags ?? '',
+            'at',
+            slot.toISOString(),
+            null,
+            dayjs().toISOString()
+          );
+          log.info('Multi-account bulk post inserted', { postId: multiPostId, account: accountNickname, fileIndex: i, scheduleAt: slot.toISOString() });
+        }
+      } else {
+        // Single account posting
+        await insertPost.run(
+          postId,
+          uid,
+          platform,
+          s.igAccount || null,
+          s.ttAccount || null,
+          files[i],
+          s.caption ?? '',
+          s.hashtags ?? '',
+          'at',
+          slot.toISOString(),
+          null,
+          dayjs().toISOString()
+        );
+        log.info('Bulk post inserted', { postId, fileIndex: i, scheduleAt: slot.toISOString() });
+      }
     } catch (error) {
       log.error('Error inserting bulk post', { postId, fileIndex: i, error: error instanceof Error ? error.message : String(error) });
     }
@@ -881,7 +1071,12 @@ async function scheduleBulkPosts(ctx: any, s: Session) {
   const formatted = firstSlot ? firstSlot.format('YYYY-MM-DD HH:mm') : 'unknown time';
   const endFormatted = lastSlot ? lastSlot.format('YYYY-MM-DD HH:mm') : 'unknown time';
   
-  await ctx.reply(`✅ **Bulk Upload Complete**\n\n📦 ${files.length} posts scheduled\n📅 First: ${formatted}\n📅 Last: ${endFormatted}`, mainMenu());
+  if (platform === 'multi_ig' && s.multiAccounts && s.multiAccounts.length > 0) {
+    const totalPosts = files.length * s.multiAccounts.length;
+    await ctx.reply(`✅ **Multi-Account Bulk Upload Complete**\n\n📦 ${totalPosts} posts scheduled across ${s.multiAccounts.length} accounts\n📅 First: ${formatted}\n📅 Last: ${endFormatted}`, mainMenu());
+  } else {
+    await ctx.reply(`✅ **Bulk Upload Complete**\n\n📦 ${files.length} posts scheduled\n📅 First: ${formatted}\n📅 Last: ${endFormatted}`, mainMenu());
+  }
   sessions.delete(ctx.from.id);
 }
 
@@ -904,21 +1099,44 @@ async function scheduleIndividualPost(ctx: any, s: Session) {
   const scheduleAt = dayjs().add(currentIndex * 2, 'minute'); // 2 minutes between posts
   
   try {
-    await insertPost.run(
-      postId,
-      uid,
-      platform,
-      s.igAccount || null,
-      s.ttAccount || null,
-      files[currentIndex],
-      s.caption ?? '',
-      s.hashtags ?? '',
-      'at',
-      scheduleAt.toISOString(),
-      null,
-      dayjs().toISOString()
-    );
-    log.info('Individual post inserted', { postId, fileIndex: currentIndex, scheduleAt: scheduleAt.toISOString() });
+    if (platform === 'multi_ig' && s.multiAccounts && s.multiAccounts.length > 0) {
+      // Multi-account posting: create one post per account
+      for (const accountNickname of s.multiAccounts) {
+        const multiPostId = uuid();
+        await insertPost.run(
+          multiPostId,
+          uid,
+          'instagram',
+          accountNickname,
+          null,
+          files[currentIndex],
+          s.caption ?? '',
+          s.hashtags ?? '',
+          'at',
+          scheduleAt.toISOString(),
+          null,
+          dayjs().toISOString()
+        );
+        log.info('Multi-account individual post inserted', { postId: multiPostId, account: accountNickname, fileIndex: currentIndex, scheduleAt: scheduleAt.toISOString() });
+      }
+    } else {
+      // Single account posting
+      await insertPost.run(
+        postId,
+        uid,
+        platform,
+        s.igAccount || null,
+        s.ttAccount || null,
+        files[currentIndex],
+        s.caption ?? '',
+        s.hashtags ?? '',
+        'at',
+        scheduleAt.toISOString(),
+        null,
+        dayjs().toISOString()
+      );
+      log.info('Individual post inserted', { postId, fileIndex: currentIndex, scheduleAt: scheduleAt.toISOString() });
+    }
   } catch (error) {
     log.error('Error inserting individual post', { postId, fileIndex: currentIndex, error: error instanceof Error ? error.message : String(error) });
   }
@@ -1416,6 +1634,23 @@ BOT.action('login_help', async (ctx) => {
   await ctx.reply(helpText, Markup.inlineKeyboard([
     [Markup.button.callback('✅ Got it', 'back_to_setup')]
   ]));
+});
+
+BOT.action('back_to_setup', async (ctx) => {
+  await ctx.answerCbQuery();
+  const s = sessions.get(ctx.from!.id);
+  if (!s?.accountSetup) {
+    await ctx.reply('Main menu:', mainMenu());
+    return;
+  }
+
+  if (s.accountSetup.platform === 'instagram') {
+    await ctx.reply('🔐 **Quick Instagram Setup**\n\nSend your Instagram credentials in this format:\n\n`username password 2fa_code`\n\nExample: `myusername mypassword 123456`\n\nIf no 2FA, use: `myusername mypassword skip`');
+  } else if (s.accountSetup.platform === 'tiktok') {
+    await ctx.reply('🔐 **Quick TikTok Setup**\n\nSend your TikTok credentials in this format:\n\n`username password 2fa_code`\n\nExample: `myusername mypassword 123456`\n\nIf no 2FA, use: `myusername mypassword skip`');
+  } else {
+    await ctx.reply('Main menu:', mainMenu());
+  }
 });
 
 BOT.action('cookie_help', async (ctx) => {
