@@ -24,15 +24,23 @@ export function cookieFilePath(platform: string, userId: string | number, nickna
 }
 
 export async function writeEncryptedJson(filePath: string, payload: unknown): Promise<void> {
+  console.log('Writing encrypted JSON', { filePath, payloadSize: JSON.stringify(payload).length });
   const data = Buffer.from(JSON.stringify(payload, null, 2));
   const encrypted = encryptBuffer(data);
+  console.log('Encryption completed', { filePath, originalSize: data.length, encryptedSize: encrypted.length });
   await storageSave(filePath, encrypted, { contentType: 'application/octet-stream' });
+  console.log('Encrypted JSON saved', { filePath });
 }
 
 export async function readEncryptedJson<T = unknown>(filePath: string): Promise<T> {
+  console.log('Reading encrypted JSON', { filePath });
   const encrypted = await storageRead(filePath);
+  console.log('Decrypting JSON', { filePath, encryptedSize: encrypted.length });
   const decrypted = decryptBuffer(encrypted);
-  return JSON.parse(decrypted.toString('utf-8')) as T;
+  console.log('Decryption completed', { filePath, decryptedSize: decrypted.length });
+  const result = JSON.parse(decrypted.toString('utf-8')) as T;
+  console.log('JSON parsed successfully', { filePath, resultType: typeof result });
+  return result;
 }
 
 export function retry<T>(fn: () => Promise<T>, attempts = 3, baseDelayMs = 500): Promise<T> {

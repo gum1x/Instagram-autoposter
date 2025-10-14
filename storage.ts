@@ -69,15 +69,38 @@ async function downloadFromSupabase(key: string): Promise<Buffer> {
 }
 
 export async function storageSave(key: string, data: Buffer, options?: SaveOptions): Promise<string> {
-  const localPath = localPathFromKey(key);
-  await fs.promises.mkdir(path.dirname(localPath), { recursive: true });
-  await fs.promises.writeFile(localPath, data);
+  console.log('Storage save called', { key, dataSize: data.length, contentType: options?.contentType, supabaseEnabled: isSupabaseEnabled() });
+  
+  try {
+    const localPath = localPathFromKey(key);
+    console.log('Creating local directory', { localPath, dirname: path.dirname(localPath) });
+    await fs.promises.mkdir(path.dirname(localPath), { recursive: true });
+    console.log('Writing local file', { localPath, size: data.length });
+    await fs.promises.writeFile(localPath, data);
+    console.log('Local file saved successfully', { localPath });
 
-  if (isSupabaseEnabled()) {
-    await uploadToSupabase(key, data, options);
+    if (isSupabaseEnabled()) {
+      console.log('Uploading to Supabase', { key, bucket: SUPABASE_BUCKET });
+      try {
+        await uploadToSupabase(key, data, options);
+        console.log('Supabase upload successful', { key });
+      } catch (error) {
+        console.error('Supabase upload failed, but local save succeeded', { key, error: error instanceof Error ? error.message : String(error) });
+        // Don't throw here - local save succeeded, Supabase is optional
+      }
+    } else {
+      console.log('Supabase not enabled, skipping cloud upload', { 
+        hasUrl: !!SUPABASE_URL, 
+        hasKey: !!SUPABASE_KEY, 
+        hasBucket: !!SUPABASE_BUCKET 
+      });
+    }
+
+    return key;
+  } catch (error) {
+    console.error('Storage save failed', { key, error: error instanceof Error ? error.message : String(error), stack: error instanceof Error ? error.stack : undefined });
+    throw error;
   }
-
-  return key;
 }
 
 export async function storageRead(key: string): Promise<Buffer> {

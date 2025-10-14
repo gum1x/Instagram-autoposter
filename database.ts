@@ -29,8 +29,6 @@ export class SQLiteAdapter implements DatabaseAdapter {
 
 export class SupabaseAdapter implements DatabaseAdapter {
   private supabase: any;
-  private cache: Map<string, any> = new Map();
-  private syncCache: Map<string, any> = new Map();
 
   constructor(url: string, key: string) {
     this.supabase = createClient(url, key);
@@ -38,16 +36,16 @@ export class SupabaseAdapter implements DatabaseAdapter {
 
   exec(sql: string) {
     console.log('Supabase exec:', sql);
-    // Tables are created manually in Supabase dashboard
-    // This method is just for logging
+    // Tables are managed in Supabase - nothing to execute synchronously here.
   }
 
   prepare(sql: string) {
+    const normalized = this.normalize(sql);
     return {
-      run: (...params: any[]) => this.executeSync(() => this.runQuery(sql, params), { changes: 0 }),
-      get: (...params: any[]) => this.executeSync(() => this.getQuery(sql, params), null),
+      run: (...params: any[]) => this.runQuery(sql, normalized, params),
+      get: (...params: any[]) => this.getQuery(sql, normalized, params),
       all: (...params: any[]) => {
-        if (sql.includes('pragma table_info(accounts)')) {
+        if (/pragma table_info\\(accounts\\)/i.test(normalized)) {
           return [
             { name: 'id' },
             { name: 'tg_user_id' },
@@ -58,267 +56,331 @@ export class SupabaseAdapter implements DatabaseAdapter {
             { name: 'created_at' }
           ];
         }
-
-        if (sql.includes('SELECT * FROM accounts') || sql.includes('select nickname, username from accounts')) {
-          const tgUserId = params[0];
-          const platform = params[1];
-
-          if (sql.includes('select nickname, username from accounts')) {
-            const cacheKey = `accounts_${tgUserId}_${platform}`;
-
-            if (this.syncCache.has(cacheKey)) {
-              return this.syncCache.get(cacheKey);
-            }
-
-            const summary = this.executeSync(() => this.allQuery(sql, params), []);
-            this.syncCache.set(cacheKey, summary);
-            return summary;
-          }
-
-          const allKey = `accounts_${tgUserId}_all`;
-          if (this.syncCache.has(allKey)) {
-            return this.syncCache.get(allKey);
-          }
-          const allAccounts = this.executeSync(() => this.allQuery(sql, params), []);
-          this.syncCache.set(allKey, allAccounts);
-          return allAccounts;
-        }
-
-        return this.executeSync(() => this.allQuery(sql, params), []);
+        return this.allQuery(sql, normalized, params);
       }
     };
   }
 
-  private executeSync<T>(fn: () => Promise<T>, fallback: T): T {
-    const sab = new SharedArrayBuffer(4);
-    const arr = new Int32Array(sab);
-    let resolved = false;
-    let result: T = fallback;
-    let error: unknown = null;
-
-    try {
-      fn().then((value) => {
-        result = value;
-        resolved = true;
-        Atomics.store(arr, 0, 1);
-        Atomics.notify(arr, 0, 1);
-      }).catch((err) => {
-        error = err;
-        resolved = true;
-        Atomics.store(arr, 0, 1);
-        Atomics.notify(arr, 0, 1);
-      });
-    } catch (err) {
-      console.error('Supabase sync execution immediate error:', err);
-      return fallback;
-    }
-
-    while (!resolved) {
-      Atomics.wait(arr, 0, 0, 1000);
-    }
-
-    if (error) {
-      console.error('Supabase sync execution error:', error);
-      return fallback;
-    }
-    return result;
+  private normalize(sql: string): string {
+    return sql.replace(/\s+/g, ' ').trim().toLowerCase();
   }
 
-  private async runQuery(sql: string, params: any) {
+  private getNamedParam(params: any[], key: string): any {
+    if (!params.length) return undefined;
+    const first = params[0];
+    if (first && typeof first === 'object' && !Array.isArray(first)) {
+      return first[key] ?? first[`:${key}`] ?? first[`@${key}`] ?? first[`$${key}`];
+    }
+    return undefined;
+  }
+
+  private async runQuery(originalSql: string, normalized: string, params: any[]) {
+    console.log('Supabase runQuery called', { sql: originalSql.substring(0, 120), paramsCount: params.length, sampleParams: params.slice(0, 3) });
     try {
-      if (sql.includes('INSERT INTO posts')) {
-        console.log('Supabase insert post - params:', params);
-        console.log('Supabase insert post - parsed:', this.parseInsertParams(sql, params));
+      if (/^insert into settings\b/.test(normalized)) {
+        const [tgUserId, hashtags, everyHours, platformPref] = params;
+        const payload = {
+          tg_user_id: tgUserId,
+          default_hashtags: hashtags ?? null,
+          default_every_hours: everyHours ?? null,
+          platform_pref: platformPref ?? null
+        };
         const { data, error } = await this.supabase
-          .from('posts')
-          .insert(this.parseInsertParams(sql, params))
+          .from('settings')
+          .upsert(payload, { onConflict: 'tg_user_id', ignoreDuplicates: true })
           .select();
-        if (error) {
-          console.error('Supabase insert post error:', error);
-          throw error;
-        }
-        console.log('Supabase insert post success:', data);
-        return { changes: data?.length || 1 }; // Assume 1 if no data returned
+        if (error) throw error;
+        return { changes: data?.length || 1 };
       }
 
-      if (sql.includes('INSERT INTO accounts') || sql.includes('insert into accounts')) {
-        console.log('Supabase insert account - params:', params);
-        console.log('Supabase insert account - SQL:', sql);
+      if (/^update settings set\b/.test(normalized)) {
+        const payloadParam = params[0] && typeof params[0] === 'object' ? params[0] : null;
+        const tgUserId = payloadParam
+          ? String(payloadParam.tg_user_id ?? payloadParam[':tg_user_id'] ?? payloadParam['@tg_user_id'])
+          : String(params[3]);
+
+        const updatePayload = payloadParam
+          ? {
+              default_hashtags: payloadParam.default_hashtags ?? payloadParam[':default_hashtags'] ?? payloadParam['@default_hashtags'] ?? null,
+              default_every_hours: payloadParam.default_every_hours ?? payloadParam[':default_every_hours'] ?? payloadParam['@default_every_hours'] ?? null,
+              platform_pref: payloadParam.platform_pref ?? payloadParam[':platform_pref'] ?? payloadParam['@platform_pref'] ?? null
+            }
+          : {
+              default_hashtags: params[0] ?? null,
+              default_every_hours: params[1] ?? null,
+              platform_pref: params[2] ?? null
+            };
+
+        const { data, error } = await this.supabase
+          .from('settings')
+          .update(updatePayload)
+          .eq('tg_user_id', tgUserId)
+          .select();
+        if (error) throw error;
+        return { changes: data?.length || 0 };
+      }
+
+      if (/^insert into posts\b/.test(normalized)) {
+        const parsed = this.parseInsertParams(params);
+        const { data, error } = await this.supabase
+          .from('posts')
+          .insert(parsed)
+          .select();
+        if (error) throw error;
+        return { changes: data?.length || 1 };
+      }
+
+      if (/^insert into accounts\b/.test(normalized)) {
+        const [tgUserId, platform, nickname, username, cookiePath, createdAt] = params;
         const { data, error } = await this.supabase
           .from('accounts')
           .insert({
-            tg_user_id: params[0],
-            platform: params[1],
-            nickname: params[2],
-            username: params[3],
-            cookie_path: params[4],
-            created_at: params[5]
+            tg_user_id: tgUserId,
+            platform,
+            nickname,
+            username,
+            cookie_path: cookiePath,
+            created_at: createdAt
           })
           .select();
-        if (error) {
-          console.error('Supabase insert account error:', error);
-          throw error; // Don't pretend it worked, throw the error
+        if (error) throw error;
+        return { changes: data?.length || 1 };
+      }
+
+      if (/^update posts set status\b/.test(normalized)) {
+        const status = this.getNamedParam(params, 'status') ?? params[0];
+        const id = this.getNamedParam(params, 'id') ?? params[1];
+        const { data, error } = await this.supabase
+          .from('posts')
+          .update({ status })
+          .eq('id', id)
+          .select();
+        if (error) throw error;
+        return { changes: data?.length || 0 };
+      }
+
+      if (/^update posts set schedule_at\b/.test(normalized)) {
+        const scheduleAt = params[0];
+        const id = params[1];
+        const { data, error } = await this.supabase
+          .from('posts')
+          .update({ schedule_at: scheduleAt })
+          .eq('id', id)
+          .select();
+        if (error) throw error;
+        return { changes: data?.length || 0 };
+      }
+
+      if (/^update posts set retry_count\b/.test(normalized)) {
+        const id = params[0];
+        const { data: existing, error: fetchError } = await this.supabase
+          .from('posts')
+          .select('retry_count')
+          .eq('id', id)
+          .single();
+        if (fetchError && fetchError.code !== 'PGRST116') throw fetchError;
+        const current = existing?.retry_count ?? 0;
+        const next = current + 1;
+        const { data, error } = await this.supabase
+          .from('posts')
+          .update({ retry_count: next })
+          .eq('id', id)
+          .select();
+        if (error) throw error;
+        return { changes: data?.length || 0 };
+      }
+
+      if (/^delete from posts\b/.test(normalized)) {
+        const tgUserId = params[0];
+        let query = this.supabase.from('posts').delete().eq('tg_user_id', tgUserId);
+        if (normalized.includes('status = \'queued\'')) {
+          query = query.eq('status', 'queued');
         }
-        console.log('Supabase insert account success:', data);
-        await this.updateAccountsCache(params[0], params[1]); // Update cache after successful insertion
-        return { changes: data?.length || 1 }; // Assume 1 if no data returned
-      }
-      
-      if (sql.includes('UPDATE posts SET status')) {
-        const { data, error } = await this.supabase
-          .from('posts')
-          .update({ status: params[0] })
-          .eq('id', params[1]);
+        const { data, error } = await query.select();
         if (error) throw error;
         return { changes: data?.length || 0 };
       }
 
-      if (sql.includes('UPDATE posts SET schedule_at')) {
-        const { data, error } = await this.supabase
-          .from('posts')
-          .update({ schedule_at: params[0] })
-          .eq('id', params[1]);
-        if (error) throw error;
-        return { changes: data?.length || 0 };
-      }
-
-      if (sql.includes('UPDATE posts SET retry_count')) {
-        const { data, error } = await this.supabase
-          .from('posts')
-          .update({ retry_count: params[0] })
-          .eq('id', params[1]);
-        if (error) throw error;
-        return { changes: data?.length || 0 };
-      }
-
-      if (sql.includes('DELETE FROM posts')) {
-        const { data, error } = await this.supabase
-          .from('posts')
-          .delete()
-          .eq('tg_user_id', Array.isArray(params) ? params[0] : params);
-        if (error) throw error;
-        return { changes: data?.length || 0 };
-      }
-
-      if (sql.includes('DELETE FROM accounts')) {
+      if (/^delete from accounts\b/.test(normalized)) {
+        const [tgUserId, platform, nickname] = params;
         const { data, error } = await this.supabase
           .from('accounts')
           .delete()
-          .eq('tg_user_id', params[0])
-          .eq('platform', params[1])
-          .eq('nickname', params[2]);
+          .eq('tg_user_id', tgUserId)
+          .eq('platform', platform)
+          .eq('nickname', nickname)
+          .select();
         if (error) throw error;
-        await this.updateAccountsCache(params[0], params[1]);
         return { changes: data?.length || 0 };
       }
 
+      console.warn('Supabase runQuery fell back to no-op for SQL:', normalized);
       return { changes: 0 };
     } catch (error) {
       console.error('Supabase runQuery error:', error);
-      return { changes: 0 };
+      throw error;
     }
   }
 
-  private async getQuery(sql: string, params: any) {
+  private async getQuery(originalSql: string, normalized: string, params: any[]) {
     try {
-      if (sql.includes('SELECT COUNT(*)')) {
-        const tgUserId = Array.isArray(params) ? params[0] : params;
-        const { count, error } = await this.supabase
+      if (/^select count\(\*\)/.test(normalized) && normalized.includes('from posts')) {
+        const tgUserId = params[0];
+        const status = normalized.includes('status') ? 'queued' : undefined;
+        let query = this.supabase
           .from('posts')
-          .select('*', { count: 'exact', head: true })
-          .eq('tg_user_id', tgUserId)
-          .eq('status', 'queued');
+          .select('id', { count: 'exact', head: true })
+          .eq('tg_user_id', tgUserId);
+        if (status) query = query.eq('status', status);
+        const { count, error } = await query;
         if (error) throw error;
-        return { count: count || 0 };
+        return { count: count ?? 0 };
       }
 
-      if (sql.includes('SELECT * FROM settings')) {
-        const tgUserId = Array.isArray(params) ? params[0] : params;
+      if (/^select \* from settings/.test(normalized)) {
+        const tgUserId = params[0];
         const { data, error } = await this.supabase
           .from('settings')
           .select('*')
           .eq('tg_user_id', tgUserId)
-          .single();
+          .maybeSingle();
         if (error) throw error;
-        return data;
+        return data ?? null;
       }
 
+      if (/^select schedule_at from posts/.test(normalized)) {
+        const tgUserId = params[0];
+        const { data, error } = await this.supabase
+          .from('posts')
+          .select('schedule_at')
+          .eq('tg_user_id', tgUserId)
+          .order('schedule_at', { ascending: false })
+          .limit(1)
+          .maybeSingle();
+        if (error) throw error;
+        return data ?? null;
+      }
+
+      if (/^select cookie_path from accounts/.test(normalized)) {
+        const [tgUserId, platform, nickname] = params;
+        const { data, error } = await this.supabase
+          .from('accounts')
+          .select('cookie_path')
+          .eq('tg_user_id', tgUserId)
+          .eq('platform', platform)
+          .eq('nickname', nickname)
+          .maybeSingle();
+        if (error) throw error;
+        return data ?? null;
+      }
+
+      if (/^select .* from accounts/.test(normalized) && normalized.includes('limit 1')) {
+        // Generic single-account lookup
+        const [tgUserId, platform, nickname] = params;
+        let query = this.supabase.from('accounts').select('*');
+        if (tgUserId !== undefined) query = query.eq('tg_user_id', tgUserId);
+        if (platform !== undefined) query = query.eq('platform', platform);
+        if (nickname !== undefined) query = query.eq('nickname', nickname);
+        const { data, error } = await query.limit(1).maybeSingle();
+        if (error) throw error;
+        return data ?? null;
+      }
+
+      console.warn('Supabase getQuery fell back to null for SQL:', normalized);
       return null;
     } catch (error) {
       console.error('Supabase getQuery error:', error);
-      return null;
+      throw error;
     }
   }
 
-  private async allQuery(sql: string, params: any) {
+  private async allQuery(originalSql: string, normalized: string, params: any[]) {
     try {
-      if (sql.includes('SELECT * FROM posts WHERE status=\'queued\'')) {
-        const { data, error } = await this.supabase
-          .from('posts')
-          .select('*')
-          .eq('status', 'queued')
-          .lte('schedule_at', new Date().toISOString())
-          .order('schedule_at', { ascending: true });
+      if (/^select \* from posts/.test(normalized)) {
+        let query = this.supabase.from('posts').select('*');
+        if (normalized.includes('status=\'queued\'')) {
+          query = query.eq('status', 'queued');
+        }
+        if (normalized.includes('tg_user_id=?')) {
+          query = query.eq('tg_user_id', params[0]);
+        }
+        if (normalized.includes('schedule_at <= now()')) {
+          query = query.lte('schedule_at', new Date().toISOString());
+        }
+        if (normalized.includes('order by schedule_at asc')) {
+          query = query.order('schedule_at', { ascending: true });
+        } else if (normalized.includes('order by schedule_at desc')) {
+          query = query.order('schedule_at', { ascending: false });
+        }
+        const { data, error } = await query;
         if (error) throw error;
-        return data || [];
+        return data ?? [];
       }
 
-      if (sql.includes('SELECT * FROM accounts')) {
-        const tgUserId = Array.isArray(params) ? params[0] : params;
+      if (/^select nickname, username from accounts/.test(normalized)) {
+        const [tgUserId, platform] = params;
         const { data, error } = await this.supabase
+          .from('accounts')
+          .select('nickname, username')
+          .eq('tg_user_id', tgUserId)
+          .eq('platform', platform)
+          .order('created_at', { ascending: false });
+        if (error) throw error;
+        return data ?? [];
+      }
+
+      if (/^select \* from accounts/.test(normalized)) {
+        const [tgUserId] = params;
+        const query = this.supabase
           .from('accounts')
           .select('*')
           .eq('tg_user_id', tgUserId)
+          .order('platform', { ascending: true })
+          .order('created_at', { ascending: false });
+        const { data, error } = await query;
+        if (error) throw error;
+        return data ?? [];
+      }
+
+      if (/^select platform, nickname, username from accounts/.test(normalized)) {
+        const [tgUserId] = params;
+        const { data, error } = await this.supabase
+          .from('accounts')
+          .select('platform, nickname, username')
+          .eq('tg_user_id', tgUserId)
+          .order('platform', { ascending: true })
           .order('created_at', { ascending: false });
         if (error) throw error;
-        return data || [];
+        return data ?? [];
       }
 
-      if (sql.includes('select nickname, username from accounts where tg_user_id=? and platform=? order by created_at desc')) {
-        console.log('Supabase accounts query - params:', params);
-        console.log('Supabase accounts query - tg_user_id:', params[0], 'platform:', params[1]);
-        
-        try {
-          const { data, error } = await this.supabase
-            .from('accounts')
-            .select('nickname, username')
-            .eq('tg_user_id', params[0])
-            .eq('platform', params[1])
-            .order('created_at', { ascending: false });
-          
-          if (error) {
-            console.error('Supabase accounts query error:', error);
-            return [];
-          }
-          
-          console.log('Supabase accounts query result:', data);
-          return data || [];
-        } catch (err) {
-          console.error('Supabase accounts query exception:', err);
-          return [];
-        }
+      if (/^select distinct tg_user_id from accounts/.test(normalized)) {
+        const { data, error } = await this.supabase
+          .from('accounts')
+          .select('tg_user_id', { distinct: true });
+        if (error) throw error;
+        return data ?? [];
       }
 
-      if (sql.includes('pragma table_info(accounts)')) {
-        return [
-          { name: 'id' },
-          { name: 'tg_user_id' },
-          { name: 'platform' },
-          { name: 'nickname' },
-          { name: 'username' },
-          { name: 'cookie_path' },
-          { name: 'created_at' }
-        ];
+      if (/^select .* from settings/.test(normalized)) {
+        const tgUserId = params[0];
+        const { data, error } = await this.supabase
+          .from('settings')
+          .select('*')
+          .eq('tg_user_id', tgUserId);
+        if (error) throw error;
+        return data ?? [];
       }
 
+      console.warn('Supabase allQuery fell back to empty array for SQL:', normalized);
       return [];
     } catch (error) {
       console.error('Supabase allQuery error:', error);
-      return [];
+      throw error;
     }
   }
 
-  private parseInsertParams(sql: string, params: any) {
+  private parseInsertParams(params: any[]) {
     return {
       id: params[0],
       tg_user_id: params[1],
@@ -331,43 +393,10 @@ export class SupabaseAdapter implements DatabaseAdapter {
       schedule_type: params[8],
       schedule_at: params[9],
       every_hours: params[10],
-      status: 'queued', // Always set to 'queued' for new posts
+      status: 'queued',
       created_at: params[11],
       retry_count: 0
     };
-  }
-
-  private async updateAccountsCache(tgUserId: string, platform: string) {
-    try {
-      const { data, error } = await this.supabase
-        .from('accounts')
-        .select('nickname, username')
-        .eq('tg_user_id', tgUserId)
-        .eq('platform', platform)
-        .order('created_at', { ascending: false });
-      
-      if (error) {
-        console.error('Supabase cache update error:', error);
-        return;
-      }
-      
-      const cacheKey = `accounts_${tgUserId}_${platform}`;
-      this.syncCache.set(cacheKey, data || []);
-      console.log(`Updated cache for user ${tgUserId} platform ${platform}:`, data);
-
-      const { data: allAccounts, error: allError } = await this.supabase
-        .from('accounts')
-        .select('*')
-        .eq('tg_user_id', tgUserId)
-        .order('platform', { ascending: true })
-        .order('created_at', { ascending: false });
-
-      if (!allError) {
-        this.syncCache.set(`accounts_${tgUserId}_all`, allAccounts || []);
-      }
-    } catch (err) {
-      console.error('Error updating accounts cache:', err);
-    }
   }
 }
 

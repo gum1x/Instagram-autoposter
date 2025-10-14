@@ -7,6 +7,7 @@ import dayjs from 'dayjs';
 import { fetchInstagramStats, fetchTikTokStats, StatsSnapshot, formatStats } from './stats.js';
 import { cookieFilePath, createLogger, ensureEnv, writeEncryptedJson } from './utils.js';
 import { storageSave } from './storage.js';
+import { WebWorker } from 'puppeteer';
 
 ensureEnv(['TELEGRAM_BOT_TOKEN', 'ENCRYPTION_KEY']);
 const BOT = new Telegraf(process.env.TELEGRAM_BOT_TOKEN!);
@@ -108,8 +109,18 @@ type Session = {
 const sessions = new Map<number, Session>();
 
 BOT.start(async (ctx) => {
-  ensureUserSettings.run(String(ctx.from.id), '#fyp,#viral', 3, 'both');
+  log.info('User started bot', { userId: ctx.from.id, username: ctx.from.username, firstName: ctx.from.first_name });
+  try {
+    await ensureUserSettings.run(String(ctx.from.id), '#fyp,#viral', 3, 'both');
+    log.info('User settings ensured', { userId: ctx.from.id });
+  } catch (error) {
+    log.error('Failed to ensure user settings', {
+      userId: ctx.from.id,
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
   await ctx.reply('👋 Ready. Choose an option:', mainMenu());
+  log.info('Main menu sent to user', { userId: ctx.from.id });
 });
 
 function mainMenu() {
@@ -122,45 +133,57 @@ function mainMenu() {
 }
 
 BOT.action('upload', async (ctx) => {
+  log.info('User clicked upload', { userId: ctx.from!.id });
   sessions.set(ctx.from!.id, { files: [] });
   await ctx.answerCbQuery();
   await ctx.reply('📸 Send me photos or videos to post. When done, type "done".');
+  log.info('Upload instructions sent to user', { userId: ctx.from!.id });
 });
 
 BOT.on('video', async (ctx) => {
+  log.info('User sent video', { userId: ctx.from.id, fileId: ctx.message.video.file_id, fileSize: ctx.message.video.file_size });
   try {
     const s = sessions.get(ctx.from.id) || { files: [] };
+    log.info('Getting video file from Telegram', { userId: ctx.from.id, fileId: ctx.message.video.file_id });
     const file = await ctx.telegram.getFile(ctx.message.video.file_id);
     const url = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
     const dest = path.join('uploads', `${ctx.message.video.file_id}.mp4`);
+    log.info('Downloading video from Telegram', { userId: ctx.from.id, url, dest });
     const res = await fetch(url);
     const buf = Buffer.from(await res.arrayBuffer());
+    log.info('Saving video to storage', { userId: ctx.from.id, dest, size: buf.length });
     await storageSave(dest, buf, { contentType: 'video/mp4' });
     s.files.push(dest);
     sessions.set(ctx.from.id, s);
+    log.info('Video saved successfully', { userId: ctx.from.id, fileCount: s.files.length, dest });
     await ctx.reply(`✅ Success saved video (${s.files.length}). Send more or type "done".`);
   } catch (error) {
+    log.error('Failed to save video', { error: error instanceof Error ? error.message : String(error), userId: ctx.from.id, fileId: ctx.message.video.file_id });
     await ctx.reply('❌ Failed to save video. Please try again.');
-    log.warn('Failed to save video', { error: error instanceof Error ? error.message : String(error), userId: ctx.from.id });
   }
 });
 
 BOT.on('photo', async (ctx) => {
+  log.info('User sent photo', { userId: ctx.from.id, photoCount: ctx.message.photo.length });
   try {
     const s = sessions.get(ctx.from.id) || { files: [] };
     const photo = ctx.message.photo[ctx.message.photo.length - 1];
+    log.info('Getting photo file from Telegram', { userId: ctx.from.id, fileId: photo.file_id, fileSize: photo.file_size });
     const file = await ctx.telegram.getFile(photo.file_id);
     const url = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
     const dest = path.join('uploads', `${photo.file_id}.jpg`);
+    log.info('Downloading photo from Telegram', { userId: ctx.from.id, url, dest });
     const res = await fetch(url);
     const buf = Buffer.from(await res.arrayBuffer());
+    log.info('Saving photo to storage', { userId: ctx.from.id, dest, size: buf.length });
     await storageSave(dest, buf, { contentType: 'image/jpeg' });
     s.files.push(dest);
     sessions.set(ctx.from.id, s);
+    log.info('Photo saved successfully', { userId: ctx.from.id, fileCount: s.files.length, dest });
     await ctx.reply(`✅ Success saved photo (${s.files.length}). Send more or type "done".`);
   } catch (error) {
+    log.error('Failed to save photo', { error: error instanceof Error ? error.message : String(error), userId: ctx.from.id });
     await ctx.reply('❌ Failed to save photo. Please try again.');
-    log.warn('Failed to save photo', { error: error instanceof Error ? error.message : String(error), userId: ctx.from.id });
   }
 });
 
@@ -199,17 +222,22 @@ BOT.on('document', async (ctx) => {
 BOT.on('text', async (ctx) => {
   const text = ctx.message.text.trim();
   const lower = text.toLowerCase();
+  log.info('User sent text message', { userId: ctx.from.id, text: text.substring(0, 100), textLength: text.length });
   const existing = sessions.get(ctx.from.id);
 
   if (!existing) {
+    log.info('No active session for user', { userId: ctx.from.id });
     return;
   }
 
   const s = existing;
+  log.info('Processing text in session', { userId: ctx.from.id, sessionState: s.expecting, hasFiles: s.files?.length > 0, hasAccountSetup: !!s.accountSetup });
 
   if (s.accountSetup) {
+    log.info('Processing account setup', { userId: ctx.from.id, platform: s.accountSetup.platform, stage: s.accountSetup.stage });
     if (s.accountSetup.stage === 'username') {
       const parts = text.trim().split(/\s+/);
+      log.info('Parsing account credentials', { userId: ctx.from.id, partsCount: parts.length, hasPassword: parts.length > 1, has2FA: parts.length > 2 });
       if (parts.length < 2) {
         await ctx.reply('❌ Please send: `username password 2fa_code` (or `username password skip` if no 2FA)');
         return;
@@ -222,37 +250,45 @@ BOT.on('text', async (ctx) => {
       s.accountSetup.stage = 'login';
       sessions.set(ctx.from.id, s);
       
+      log.info('Starting account login', { userId: ctx.from.id, platform: s.accountSetup.platform, username: s.accountSetup.username, has2FA: !!s.accountSetup.twoFactorCode });
       await ctx.reply('🔐 Logging in with all credentials...');
       
       if (s.accountSetup.platform === 'instagram') {
         // Use instagrapi service for Instagram login
+        log.info('Using instagrapi service for Instagram login', { userId: ctx.from.id, username: s.accountSetup.username });
         const { InstagrapiClient } = await import('./instagrapi-client.js');
         const ig = new InstagrapiClient();
         
         try {
+          log.info('Calling instagrapi login', { userId: ctx.from.id, username: s.accountSetup.username, has2FA: !!s.accountSetup.twoFactorCode });
           const result = await ig.login({
             username: s.accountSetup.username!,
             password: s.accountSetup.password!,
             verification_code: s.accountSetup.twoFactorCode
           });
           
+          log.info('Instagrapi login result', { userId: ctx.from.id, success: result.success, hasSettings: !!result.settings, detail: result.detail });
+          
           if (result.success && result.settings) {
             // Save settings JSON instead of cookies
             const file = cookieFilePath(s.accountSetup.platform, ctx.from.id, s.accountSetup.nickname!);
+            log.info('Saving account settings to file', { userId: ctx.from.id, file, settingsSize: JSON.stringify(result.settings).length });
             await writeEncryptedJson(file, result.settings);
             
             // Save to database
-            deleteAccount.run(String(ctx.from.id), s.accountSetup.platform, s.accountSetup.nickname!);
-            addAccount.run(String(ctx.from.id), s.accountSetup.platform, s.accountSetup.nickname!, s.accountSetup.username!, file, dayjs().toISOString());
+            log.info('Saving account to database', { userId: ctx.from.id, platform: s.accountSetup.platform, nickname: s.accountSetup.nickname, username: s.accountSetup.username });
+            await deleteAccount.run(String(ctx.from.id), s.accountSetup.platform, s.accountSetup.nickname!);
+            await addAccount.run(String(ctx.from.id), s.accountSetup.platform, s.accountSetup.nickname!, s.accountSetup.username!, file, dayjs().toISOString());
             
             await ctx.reply(`✅ Successfully logged in and saved ${s.accountSetup.platform} account "${s.accountSetup.nickname}".`, mainMenu());
             log.info('Account setup completed with instagrapi', { platform: s.accountSetup.platform, nickname: s.accountSetup.nickname, userId: ctx.from.id });
           } else {
+            log.error('Instagrapi login failed', { userId: ctx.from.id, detail: result.detail });
             await ctx.reply(`❌ Login failed: ${result.detail || 'Unknown error'}\n\nPlease try again with /add_account.`);
           }
         } catch (error) {
+          log.error('Login failed during account setup', { error: error instanceof Error ? error.message : String(error), userId: ctx.from.id, username: s.accountSetup.username });
           await ctx.reply(`❌ Login failed: ${error instanceof Error ? error.message : String(error)}\n\nPlease try again with /add_account.`);
-          log.error('Login failed during account setup', { error: error instanceof Error ? error.message : String(error), userId: ctx.from.id });
         }
       } else if (s.accountSetup.platform === 'tiktok') {
         // For TikTok, still use cookie method but with fast setup
@@ -335,12 +371,12 @@ BOT.on('text', async (ctx) => {
 
   if (s.expecting === 'settingsHashtags') {
     const uid = String(ctx.from.id);
-    ensureUserSettings.run(uid, '#fyp,#viral', 3, 'both');
-    const settings = getSettings.get(uid) as any;
+    await ensureUserSettings.run(uid, '#fyp,#viral', 3, 'both');
+    const settings = await getSettings.get(uid) as any;
     if (lower === 'skip') {
       await ctx.reply('No changes.', mainMenu());
     } else {
-      updateSettings.run({
+      await updateSettings.run({
         tg_user_id: uid,
         default_hashtags: ctx.message.text,
         default_every_hours: settings?.default_every_hours ?? 3,
@@ -364,7 +400,7 @@ BOT.on('text', async (ctx) => {
   if (s.expecting === 'hashtags') {
     console.log('Hashtags received for user:', ctx.from.id, 'text:', ctx.message.text);
     if (lower === 'defaults') {
-      const set = getSettings.get(String(ctx.from.id));
+      const set = await getSettings.get(String(ctx.from.id)) as any;
       s.hashtags = set?.default_hashtags || '#fyp,#viral';
     } else {
       s.hashtags = ctx.message.text;
@@ -390,7 +426,7 @@ async function selectPlatform(ctx:any, p:'instagram'|'tiktok'|'both'){
   await ctx.answerCbQuery();
 
   if (p === 'instagram' || p === 'both') {
-    const igs = listAccounts.all(String(ctx.from.id), 'instagram') as any[];
+    const igs = await listAccounts.all(String(ctx.from.id), 'instagram') as any[];
     console.log('Instagram accounts query result:', igs);
     if (!Array.isArray(igs) || igs.length === 0) {
       await ctx.reply('No Instagram accounts saved. Add one in Accounts → Add IG.');
@@ -399,7 +435,7 @@ async function selectPlatform(ctx:any, p:'instagram'|'tiktok'|'both'){
     }
   }
   if (p === 'tiktok' || p === 'both') {
-    const tts = listAccounts.all(String(ctx.from.id), 'tiktok') as any[];
+    const tts = await listAccounts.all(String(ctx.from.id), 'tiktok') as any[];
     console.log('TikTok accounts query result:', tts);
     if (!Array.isArray(tts) || tts.length === 0) {
       await ctx.reply('No TikTok accounts saved. Add one in Accounts → Add TT.');
@@ -489,7 +525,7 @@ async function chooseWhen(ctx:any, w:'now'|'after2h'|'tomorrow'|'at'|'everyXh'|'
 async function persistScheduledPosts(userId:number, s:Session){
   console.log('persistScheduledPosts called for user:', userId, 'session:', s);
   const uid = String(userId);
-  const settings = getSettings.get(uid) as any;
+  const settings = await getSettings.get(uid) as any;
   const files = s.files || [];
   console.log('Files to process:', files.length, files);
   if (!files.length) {
@@ -502,7 +538,7 @@ async function persistScheduledPosts(userId:number, s:Session){
   let firstAt = now;
 
   if (when === 'after2h') {
-    const lastRow = lastScheduledForUser.get(uid) as { schedule_at?: string } | undefined;
+    const lastRow = await lastScheduledForUser.get(uid) as { schedule_at?: string } | undefined;
     const lastAt = lastRow?.schedule_at ? dayjs(lastRow.schedule_at) : null;
     const reference = lastAt && lastAt.isValid() && lastAt.isAfter(now) ? lastAt : now;
     firstAt = reference.add(2, 'hour');
@@ -607,12 +643,12 @@ BOT.action('acc_add_tt', async (ctx)=>{
 
 BOT.action('acc_list_ig', async (ctx)=>{
   await ctx.answerCbQuery();
-  const rows = listAccounts.all(String(ctx.from!.id), 'instagram') as any[];
+  const rows = await listAccounts.all(String(ctx.from!.id), 'instagram') as any[];
   await ctx.reply(rows.length? ('IG accounts:\n- '+rows.map(r=>r.nickname).join('\n- ')) : 'No IG accounts saved.');
 });
 BOT.action('acc_list_tt', async (ctx)=>{
   await ctx.answerCbQuery();
-  const rows = listAccounts.all(String(ctx.from!.id), 'tiktok') as any[];
+  const rows = await listAccounts.all(String(ctx.from!.id), 'tiktok') as any[];
   await ctx.reply(rows.length? ('TT accounts:\n- '+rows.map(r=>r.nickname).join('\n- ')) : 'No TT accounts saved.');
 });
 
@@ -646,8 +682,8 @@ async function saveCookies(ctx:any, platform:'instagram'|'tiktok', username:stri
     
     const file = cookieFilePath(platform, ctx.from.id, nickname);
     await writeEncryptedJson(file, cookies);
-    deleteAccount.run(String(ctx.from.id), platform, nickname);
-    addAccount.run(String(ctx.from.id), platform, nickname, username, file, dayjs().toISOString());
+    await deleteAccount.run(String(ctx.from.id), platform, nickname);
+    await addAccount.run(String(ctx.from.id), platform, nickname, username, file, dayjs().toISOString());
     await ctx.reply(`✅ Saved cookies for ${platform} account "${nickname}".`, mainMenu());
     log.info('Saved account cookies', { platform, nickname, userId: ctx.from.id });
   }catch(e){
@@ -748,13 +784,14 @@ BOT.action('schedule', async (ctx)=>{
   await ctx.answerCbQuery();
   const uid = String(ctx.from!.id);
   
-  const upcomingPosts = db.prepare(`
+  const upcomingPostsStmt = db.prepare(`
     SELECT id, platform, ig_account, tt_account, caption, schedule_at, status, schedule_type, every_hours
     FROM posts 
     WHERE tg_user_id = ? AND status = 'queued' 
     ORDER BY datetime(schedule_at) ASC 
     LIMIT 10
-  `).all(uid) as any[];
+  `);
+  const upcomingPosts = await upcomingPostsStmt.all(uid) as any[];
   
   if (upcomingPosts.length === 0) {
     await ctx.reply('📅 **No scheduled posts**\n\nTo schedule posts:\n1. Click "📤 Upload videos"\n2. Choose your schedule options\n3. Posts will appear here', 
@@ -887,8 +924,8 @@ BOT.action('save_cookies_anyway', async (ctx) => {
   if (s?.accountSetup && s.tempCookies) {
     const file = cookieFilePath(s.accountSetup.platform, ctx.from.id, s.accountSetup.nickname);
     await writeEncryptedJson(file, s.tempCookies);
-    deleteAccount.run(String(ctx.from.id), s.accountSetup.platform, s.accountSetup.nickname);
-    addAccount.run(String(ctx.from.id), s.accountSetup.platform, s.accountSetup.nickname, s.accountSetup.username!, file, dayjs().toISOString());
+    await deleteAccount.run(String(ctx.from.id), s.accountSetup.platform, s.accountSetup.nickname);
+    await addAccount.run(String(ctx.from.id), s.accountSetup.platform, s.accountSetup.nickname, s.accountSetup.username!, file, dayjs().toISOString());
     await ctx.reply(`✅ Saved cookies for ${s.accountSetup.platform} account "${s.accountSetup.nickname}" (with warnings).`, mainMenu());
     log.info('Saved account cookies with warnings', { platform: s.accountSetup.platform, nickname: s.accountSetup.nickname, userId: ctx.from.id });
     delete s.accountSetup;
@@ -913,16 +950,15 @@ BOT.action('clear_schedule', async (ctx) => {
   await ctx.answerCbQuery();
   const uid = String(ctx.from!.id);
   
-  const count = db.prepare(`SELECT COUNT(*) as count FROM posts WHERE tg_user_id = ? AND status = 'queued'`).get(uid) as {count: number};
+  const countRow = await db.prepare(`SELECT COUNT(*) as count FROM posts WHERE tg_user_id = ? AND status = 'queued'`).get(uid) as {count: number};
+  const count = countRow?.count ?? 0;
   
-  if (count.count === 0) {
-    await ctx.reply('No scheduled posts to clear.', Markup.inlineKeyboard([
-      [Markup.button.callback('↩️ Back', 'back')]
-    ]));
+  if (count === 0) {
+    await ctx.reply('No scheduled posts to clear.', Markup.inlineKeyboard([[Markup.button.callback('↩️ Back', 'back')]]));
     return;
   }
   
-  await ctx.reply(`🗑️ **Clear ${count.count} scheduled posts?**\n\nThis will delete all queued posts permanently.`, 
+  await ctx.reply(`🗑️ **Clear ${count} scheduled posts?**\n\nThis will delete all queued posts permanently.`, 
     Markup.inlineKeyboard([
       [Markup.button.callback('✅ Yes, Clear All', 'confirm_clear'), Markup.button.callback('❌ Cancel', 'schedule')]
     ])
@@ -933,9 +969,10 @@ BOT.action('confirm_clear', async (ctx) => {
   await ctx.answerCbQuery();
   const uid = String(ctx.from!.id);
   
-  const deleted = db.prepare(`DELETE FROM posts WHERE tg_user_id = ? AND status = 'queued'`).run(uid);
+  const deleteStmt = db.prepare(`DELETE FROM posts WHERE tg_user_id = ? AND status = 'queued'`);
+  const deleted = await deleteStmt.run(uid);
   
-  await ctx.reply(`✅ Cleared ${deleted.changes} scheduled posts.`, Markup.inlineKeyboard([
+  await ctx.reply(`✅ Cleared ${deleted?.changes ?? 0} scheduled posts.`, Markup.inlineKeyboard([
     [Markup.button.callback('📤 Upload Videos', 'upload'), Markup.button.callback('↩️ Back', 'back')]
   ]));
 });
@@ -943,7 +980,7 @@ BOT.action('confirm_clear', async (ctx) => {
 BOT.action('stats', async (ctx)=>{
   await ctx.answerCbQuery();
   const uid = String(ctx.from!.id);
-  const accounts = listAllAccounts.all(uid) as any[];
+  const accounts = await listAllAccounts.all(uid) as any[];
   if (accounts.length === 0) {
     await ctx.reply('No accounts saved yet. Add one under Accounts → Add IG/TT.', mainMenu());
     return;
@@ -985,6 +1022,16 @@ function splitButtons(btns:any[], perRow=3){
   return rows;
 }
 
+
+// Add global error handler
+BOT.catch((err, ctx) => {
+  log.error('Unhandled bot error', { 
+    error: err instanceof Error ? err.message : String(err), 
+    userId: ctx?.from?.id,
+    updateType: ctx?.updateType,
+    stack: err instanceof Error ? err.stack : undefined
+  });
+});
 
 BOT.launch().then(()=>log.info('Bot online')).catch(err=>log.error('Bot launch failed', err));
 
