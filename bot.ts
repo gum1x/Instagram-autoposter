@@ -172,6 +172,7 @@ function mainMenu() {
     [Markup.button.callback('📤 Upload videos', 'upload')],
     [Markup.button.callback('🗓️ Schedule', 'schedule'), Markup.button.callback('🏷️ Hashtags', 'hashtags')],
     [Markup.button.callback('👥 Accounts', 'accounts'), Markup.button.callback('🌐 Proxies', 'proxies')],
+    [Markup.button.callback('🕵️ Stealth', 'stealth')],
     [Markup.button.callback('📊 Stats', 'stats')]
   ]);
 }
@@ -2157,6 +2158,58 @@ BOT.action('confirm_clear', async (ctx) => {
     [Markup.button.callback('📤 Upload Videos', 'upload'), Markup.button.callback('↩️ Back', 'back')]
   ]));
 });
+
+const STEALTH_SUMMARY = [
+  '🛡️ Stealth toolkit is baked into every post:',
+  '• Stealth Plugin — hides common automation signals in Chromium.',
+  '• User-Agent Rotation — pretends to be different desktop browsers.',
+  '• Viewport Shuffles — randomizes screen size and pixel density.',
+  '• Timezone Emulation — switches between realistic time zones.',
+  '• Humanized Input — moves the mouse, scrolls, and types like a person.',
+  '',
+  'Tap a control to learn more about each layer.'
+].join('\n');
+
+const STEALTH_DETAILS: Record<string, { label: string; text: string }> = {
+  stealth_opt_plugin: {
+    label: 'Stealth Plugin',
+    text: 'The stealth plugin removes telltale Chromium automation flags (like navigator.webdriver) and patches features that sites use to spot bots.'
+  },
+  stealth_opt_ua: {
+    label: 'User-Agent',
+    text: 'Each session picks a desktop browser user-agent (Chrome, Safari, Firefox) so Instagram sees normal device fingerprints across runs.'
+  },
+  stealth_opt_viewport: {
+    label: 'Viewport',
+    text: 'Viewport sizes, scale factors, and window dimensions change per launch to mimic real monitors instead of a fixed bot resolution.'
+  },
+  stealth_opt_timezone: {
+    label: 'Timezone',
+    text: 'The bot emulates popular timezones (NY, LA, London) so your login origin shifts naturally alongside other fingerprint data.'
+  },
+  stealth_opt_human: {
+    label: 'Human Input',
+    text: 'Mouse moves, scrolls, typing cadence, and button clicks include natural pauses and offsets so interactions look human.'
+  }
+};
+
+const STEALTH_KEYBOARD = Markup.inlineKeyboard([
+  [Markup.button.callback('Stealth Plugin', 'stealth_opt_plugin'), Markup.button.callback('User-Agent', 'stealth_opt_ua')],
+  [Markup.button.callback('Viewport', 'stealth_opt_viewport'), Markup.button.callback('Timezone', 'stealth_opt_timezone')],
+  [Markup.button.callback('Human Input', 'stealth_opt_human'), Markup.button.callback('↩️ Back', 'back')]
+]);
+
+BOT.action('stealth', async (ctx)=>{
+  await ctx.answerCbQuery();
+  await ctx.reply(STEALTH_SUMMARY, STEALTH_KEYBOARD);
+});
+
+for (const [key, detail] of Object.entries(STEALTH_DETAILS)) {
+  BOT.action(key, async (ctx) => {
+    await ctx.answerCbQuery(detail.label);
+    await ctx.reply(`🕵️ ${detail.label}\n\n${detail.text}`, STEALTH_KEYBOARD);
+  });
+}
 
 BOT.action('stats', async (ctx)=>{
   await ctx.answerCbQuery();
